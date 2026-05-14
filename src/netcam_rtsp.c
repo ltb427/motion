@@ -58,6 +58,12 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
 static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet);
 static void *netcam_rtsp_record_handler(void *arg);
 
+static int netcam_rtsp_valid_timebase(AVRational tb)
+{
+
+    return ((tb.num > 0) && (tb.den > 0));
+}
+
 static void netcam_rtsp_free_pkt(struct rtsp_context *rtsp_data)
 {
     if (rtsp_data->packet_recv != NULL) {
@@ -113,6 +119,8 @@ static void netcam_rtsp_null_context(struct rtsp_context *rtsp_data)
     rtsp_data->record_format   = NULL;
     rtsp_data->record_stream_map = NULL;
     rtsp_data->record_stream_map_size = 0;
+    rtsp_data->record_last_dts = NULL;
+    rtsp_data->record_last_pts = NULL;
     rtsp_data->record_active   = FALSE;
 
 }
@@ -131,6 +139,14 @@ static void netcam_rtsp_record_close_lck(struct rtsp_context *rtsp_data)
     if (rtsp_data->record_stream_map != NULL) {
         free(rtsp_data->record_stream_map);
         rtsp_data->record_stream_map = NULL;
+    }
+    if (rtsp_data->record_last_dts != NULL) {
+        free(rtsp_data->record_last_dts);
+        rtsp_data->record_last_dts = NULL;
+    }
+    if (rtsp_data->record_last_pts != NULL) {
+        free(rtsp_data->record_last_pts);
+        rtsp_data->record_last_pts = NULL;
     }
     rtsp_data->record_stream_map_size = 0;
 }
@@ -248,6 +264,7 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
 
     int indx;
     int retcd;
+    int mapped_streams;
     AVFormatContext *record_format;
     AVStream *stream_in;
     AVStream *stream_out;
@@ -291,15 +308,52 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
         }
 
         rtsp_data->record_stream_map_size = rtsp_data->format_context->nb_streams;
-        rtsp_data->record_stream_map = mymalloc(sizeof(int) * rtsp_data->record_stream_map_size);
-        for (indx = 0; indx < rtsp_data->record_stream_map_size; indx++) {
-            rtsp_data->record_stream_map[indx] = -1;
+        if (rtsp_data->record_stream_map_size <= 0) {
+            avio_close(record_format->pb);
+            avformat_free_context(record_format);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Camera stream list is empty; cannot start mp4 recording")
+                ,rtsp_data->cameratype);
+            return -1;
         }
 
+        rtsp_data->record_stream_map = mymalloc(sizeof(int) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_last_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_last_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        for (indx = 0; indx < rtsp_data->record_stream_map_size; indx++) {
+            rtsp_data->record_stream_map[indx] = -1;
+            rtsp_data->record_last_dts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_last_pts[indx] = AV_NOPTS_VALUE;
+        }
+
+        mapped_streams = 0;
         for (indx = 0; indx < rtsp_data->format_context->nb_streams; indx++) {
             stream_in = rtsp_data->format_context->streams[indx];
+            if ((stream_in == NULL) || (stream_in->codecpar == NULL)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping invalid stream metadata (stream %d)")
+                    ,rtsp_data->cameratype, indx);
+                continue;
+            }
+
             if ((stream_in->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) &&
                 (stream_in->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)) {
+                continue;
+            }
+
+            if (!netcam_rtsp_valid_timebase(stream_in->time_base)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping stream with invalid time base (stream %d)")
+                    ,rtsp_data->cameratype, indx);
+                continue;
+            }
+
+            if (!avformat_query_codec(record_format->oformat
+                , stream_in->codecpar->codec_id, FF_COMPLIANCE_NORMAL)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping unsupported codec for mp4 (stream %d, codec_id=%d)")
+                    ,rtsp_data->cameratype, indx, stream_in->codecpar->codec_id);
                 continue;
             }
 
@@ -309,6 +363,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
                 avformat_free_context(record_format);
                 free(rtsp_data->record_stream_map);
                 rtsp_data->record_stream_map = NULL;
+                free(rtsp_data->record_last_dts);
+                rtsp_data->record_last_dts = NULL;
+                free(rtsp_data->record_last_pts);
+                rtsp_data->record_last_pts = NULL;
                 rtsp_data->record_stream_map_size = 0;
                 pthread_mutex_unlock(&rtsp_data->mutex_record);
                 return -1;
@@ -320,6 +378,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
                 avformat_free_context(record_format);
                 free(rtsp_data->record_stream_map);
                 rtsp_data->record_stream_map = NULL;
+                free(rtsp_data->record_last_dts);
+                rtsp_data->record_last_dts = NULL;
+                free(rtsp_data->record_last_pts);
+                rtsp_data->record_last_pts = NULL;
                 rtsp_data->record_stream_map_size = 0;
                 pthread_mutex_unlock(&rtsp_data->mutex_record);
                 return retcd;
@@ -328,6 +390,24 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
             stream_out->codecpar->codec_tag = 0;
             stream_out->time_base = stream_in->time_base;
             rtsp_data->record_stream_map[indx] = stream_out->index;
+            mapped_streams++;
+        }
+
+        if (mapped_streams == 0) {
+            avio_close(record_format->pb);
+            avformat_free_context(record_format);
+            free(rtsp_data->record_stream_map);
+            rtsp_data->record_stream_map = NULL;
+            free(rtsp_data->record_last_dts);
+            rtsp_data->record_last_dts = NULL;
+            free(rtsp_data->record_last_pts);
+            rtsp_data->record_last_pts = NULL;
+            rtsp_data->record_stream_map_size = 0;
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: No mp4-compatible streams found for event recording")
+                ,rtsp_data->cameratype);
+            return -1;
         }
 
         retcd = avformat_write_header(record_format, NULL);
@@ -336,6 +416,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
             avformat_free_context(record_format);
             free(rtsp_data->record_stream_map);
             rtsp_data->record_stream_map = NULL;
+            free(rtsp_data->record_last_dts);
+            rtsp_data->record_last_dts = NULL;
+            free(rtsp_data->record_last_pts);
+            rtsp_data->record_last_pts = NULL;
             rtsp_data->record_stream_map_size = 0;
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return retcd;
@@ -963,6 +1047,14 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
 {
 
     int retcd;
+    int in_index;
+    int out_index;
+    int64_t pkt_dts;
+    int64_t pkt_pts;
+    int64_t pkt_duration;
+    int64_t last_dts;
+    int64_t last_pts;
+    int64_t step;
     AVStream *stream_in;
     AVStream *stream_out;
 
@@ -970,27 +1062,96 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
         if ((rtsp_data->record_format == NULL) ||
             (rtsp_data->format_context == NULL) ||
             (rtsp_data->record_stream_map == NULL) ||
+            (rtsp_data->record_last_dts == NULL) ||
+            (rtsp_data->record_last_pts == NULL) ||
             (packet->stream_index < 0) ||
             (packet->stream_index >= rtsp_data->record_stream_map_size)) {
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return 0;
         }
 
-        if (rtsp_data->record_stream_map[packet->stream_index] < 0) {
+        in_index = packet->stream_index;
+        out_index = rtsp_data->record_stream_map[in_index];
+
+        if (out_index < 0) {
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return 0;
         }
 
-        if ((packet->stream_index >= rtsp_data->format_context->nb_streams) ||
-            (rtsp_data->record_stream_map[packet->stream_index] >= rtsp_data->record_format->nb_streams)) {
+        if ((in_index >= rtsp_data->format_context->nb_streams) ||
+            (out_index >= rtsp_data->record_format->nb_streams)) {
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return 0;
         }
 
-        stream_in = rtsp_data->format_context->streams[packet->stream_index];
-        stream_out = rtsp_data->record_format->streams[rtsp_data->record_stream_map[packet->stream_index]];
-        av_packet_rescale_ts(packet, stream_in->time_base, stream_out->time_base);
-        packet->stream_index = rtsp_data->record_stream_map[packet->stream_index];
+        stream_in = rtsp_data->format_context->streams[in_index];
+        stream_out = rtsp_data->record_format->streams[out_index];
+        if ((stream_in == NULL) || (stream_out == NULL)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+        if ((!netcam_rtsp_valid_timebase(stream_in->time_base)) ||
+            (!netcam_rtsp_valid_timebase(stream_out->time_base))) {
+            MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Dropping packet due to invalid stream time base")
+                ,rtsp_data->cameratype);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        pkt_dts = packet->dts;
+        pkt_pts = packet->pts;
+        pkt_duration = packet->duration;
+
+        if ((pkt_dts == AV_NOPTS_VALUE) && (pkt_pts != AV_NOPTS_VALUE)) {
+            pkt_dts = pkt_pts;
+        }
+        if ((pkt_pts == AV_NOPTS_VALUE) && (pkt_dts != AV_NOPTS_VALUE)) {
+            pkt_pts = pkt_dts;
+        }
+
+        if ((pkt_dts == AV_NOPTS_VALUE) && (pkt_pts == AV_NOPTS_VALUE)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            pkt_dts = av_rescale_q_rnd(pkt_dts, stream_in->time_base, stream_out->time_base
+                ,AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        }
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            pkt_pts = av_rescale_q_rnd(pkt_pts, stream_in->time_base, stream_out->time_base
+                ,AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        }
+        if (pkt_duration > 0) {
+            pkt_duration = av_rescale_q(pkt_duration, stream_in->time_base, stream_out->time_base);
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            last_dts = rtsp_data->record_last_dts[in_index];
+            if ((last_dts != AV_NOPTS_VALUE) && (pkt_dts <= last_dts)) {
+                step = (pkt_duration > 0) ? pkt_duration : 1;
+                pkt_dts = last_dts + step;
+            }
+            rtsp_data->record_last_dts[in_index] = pkt_dts;
+        }
+
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            last_pts = rtsp_data->record_last_pts[in_index];
+            if ((last_pts != AV_NOPTS_VALUE) && (pkt_pts <= last_pts)) {
+                step = (pkt_duration > 0) ? pkt_duration : 1;
+                pkt_pts = last_pts + step;
+            }
+            if ((pkt_dts != AV_NOPTS_VALUE) && (pkt_pts < pkt_dts)) {
+                pkt_pts = pkt_dts;
+            }
+            rtsp_data->record_last_pts[in_index] = pkt_pts;
+        }
+
+        packet->dts = pkt_dts;
+        packet->pts = pkt_pts;
+        packet->duration = (pkt_duration > 0) ? pkt_duration : 0;
+        packet->stream_index = out_index;
         packet->pos = -1;
 
         retcd = av_interleaved_write_frame(rtsp_data->record_format, packet);
@@ -1860,6 +2021,8 @@ static void netcam_rtsp_set_parms (struct context *cnt, struct rtsp_context *rts
     rtsp_data->record_format = NULL;
     rtsp_data->record_stream_map = NULL;
     rtsp_data->record_stream_map_size = 0;
+    rtsp_data->record_last_dts = NULL;
+    rtsp_data->record_last_pts = NULL;
     rtsp_data->record_active = FALSE;
     rtsp_data->record_pktqueue = NULL;
     rtsp_data->record_pktqueue_size = 0;

@@ -60,6 +60,8 @@ struct imgsize_context {
         AVFormatContext          *record_format;         /* Format context used for event recording */
         int                      *record_stream_map;     /* Input stream index to output stream index */
         int                       record_stream_map_size;/* Number of entries in record_stream_map */
+        int64_t                  *record_last_dts;       /* Last written dts for each input stream */
+        int64_t                  *record_last_pts;       /* Last written pts for each input stream */
         int                       record_active;         /* Whether event recording is active */
         AVPacket                **record_pktqueue;       /* Queue of packets pending event recording */
         int                       record_pktqueue_size;  /* Queue capacity */
