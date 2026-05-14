@@ -57,6 +57,18 @@ struct imgsize_context {
         struct SwsContext        *swsctx;                /* Context for the resizing of the image */
         AVPacket                 *packet_recv;           /* The packet that is currently being processed */
         AVFormatContext          *transfer_format;       /* Format context just for transferring to pass-through */
+        AVFormatContext          *record_format;         /* Format context used for event recording */
+        int                      *record_stream_map;     /* Input stream index to output stream index */
+        int                       record_stream_map_size;/* Number of entries in record_stream_map */
+        int                       record_active;         /* Whether event recording is active */
+        AVPacket                **record_pktqueue;       /* Queue of packets pending event recording */
+        int                       record_pktqueue_size;  /* Queue capacity */
+        int                       record_pktqueue_head;  /* Queue read index */
+        int                       record_pktqueue_tail;  /* Queue write index */
+        int                       record_pktqueue_count; /* Number of queued packets */
+        int                       record_thread_finish;  /* Request the record thread to finish */
+        int                       record_thread_finished;/* Whether record thread has exited */
+        int                       record_sync_init;      /* Whether record mutex/cond are initialized */
         struct packet_item       *pktarray;              /* Pointer to array of packets for passthru processing */
         int                       pktarray_size;         /* The number of packets in array.  1 based */
         int                       pktarray_index;        /* The index to the most current packet in array */
@@ -109,9 +121,13 @@ struct imgsize_context {
         char                      threadname[16];   /* The thread name*/
         int                       threadnbr;        /* The thread number */
         pthread_t                 thread_id;        /* thread i.d. for a camera-handling thread (if required). */
+        pthread_t                 record_thread_id; /* thread i.d. for record writing thread */
         pthread_mutex_t           mutex;            /* mutex used with conditional waits */
         pthread_mutex_t           mutex_transfer;   /* mutex used with transferring stream info for pass-through */
         pthread_mutex_t           mutex_pktarray;   /* mutex used with the packet array */
+        pthread_mutex_t           mutex_record;     /* mutex used with event recording format state */
+        pthread_mutex_t           mutex_recordq;    /* mutex used with event recording queue */
+        pthread_cond_t            cond_recordq;     /* condition variable used by event recording queue */
 
     };
 
@@ -128,5 +144,7 @@ struct imgsize_context {
 int netcam_rtsp_setup(struct context *cnt);
 int netcam_rtsp_next(struct context *cnt, struct image_data *img_data);
 void netcam_rtsp_cleanup(struct context *cnt, int init_retry_flag);
+int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filename);
+void netcam_rtsp_record_stop(struct rtsp_context *rtsp_data);
 
 #endif /* _INCLUDE_NETCAM_RTSP_H */

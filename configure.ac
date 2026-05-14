@@ -192,7 +192,7 @@ AS_IF([test "${WEBP}" = "yes" ], [
         AC_MSG_RESULT(yes)
         AC_DEFINE([HAVE_WEBP], [1], [Define to 1 if WEBP is around])
         TEMP_CFLAGS="$TEMP_CFLAGS "`pkg-config --cflags libwebpmux`
-        TEMP_LIBS="$TEMP_LIBS "`pkg-config --libs libwebpmux`
+        TEMP_LIBS="$TEMP_LIBS "`pkg-config --libs libwebpmux libwebp`
       ],[
         AC_MSG_RESULT(no)
       ]
