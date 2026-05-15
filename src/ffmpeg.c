@@ -1588,6 +1588,12 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, struct image_data *img_data, const s
 void ffmpeg_reset_movie_start_time(struct ffmpeg *ffmpeg, const struct timeval *tv1)
 {
     #ifdef HAVE_FFMPEG
+        if ((ffmpeg == NULL) || (tv1 == NULL) ||
+            (ffmpeg->passthrough) || (ffmpeg->video_st == NULL) ||
+            (ffmpeg->fps <= 0)) {
+            return;
+        }
+
         int64_t one_frame_interval = av_rescale_q(1,(AVRational){1, ffmpeg->fps},ffmpeg->video_st->time_base);
         if (one_frame_interval <= 0) {
             one_frame_interval = 1;
