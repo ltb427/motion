@@ -62,6 +62,8 @@ struct imgsize_context {
         int                       record_stream_map_size;/* Number of entries in record_stream_map */
         int64_t                  *record_last_dts;       /* Last written dts for each input stream */
         int64_t                  *record_last_pts;       /* Last written pts for each input stream */
+        int64_t                  *record_base_dts;       /* First dts per input stream, used to rebase to 0 */
+        int64_t                  *record_base_pts;       /* First pts per input stream, used to rebase to 0 */
         int                       record_active;         /* Whether event recording is active */
         AVPacket                **record_pktqueue;       /* Queue of packets pending event recording */
         int                       record_pktqueue_size;  /* Queue capacity */

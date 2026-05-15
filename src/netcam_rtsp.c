@@ -121,6 +121,8 @@ static void netcam_rtsp_null_context(struct rtsp_context *rtsp_data)
     rtsp_data->record_stream_map_size = 0;
     rtsp_data->record_last_dts = NULL;
     rtsp_data->record_last_pts = NULL;
+    rtsp_data->record_base_dts = NULL;
+    rtsp_data->record_base_pts = NULL;
     rtsp_data->record_active   = FALSE;
 
 }
@@ -147,6 +149,14 @@ static void netcam_rtsp_record_close_lck(struct rtsp_context *rtsp_data)
     if (rtsp_data->record_last_pts != NULL) {
         free(rtsp_data->record_last_pts);
         rtsp_data->record_last_pts = NULL;
+    }
+    if (rtsp_data->record_base_dts != NULL) {
+        free(rtsp_data->record_base_dts);
+        rtsp_data->record_base_dts = NULL;
+    }
+    if (rtsp_data->record_base_pts != NULL) {
+        free(rtsp_data->record_base_pts);
+        rtsp_data->record_base_pts = NULL;
     }
     rtsp_data->record_stream_map_size = 0;
 }
@@ -321,10 +331,14 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
         rtsp_data->record_stream_map = mymalloc(sizeof(int) * rtsp_data->record_stream_map_size);
         rtsp_data->record_last_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
         rtsp_data->record_last_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_base_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_base_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
         for (indx = 0; indx < rtsp_data->record_stream_map_size; indx++) {
             rtsp_data->record_stream_map[indx] = -1;
             rtsp_data->record_last_dts[indx] = AV_NOPTS_VALUE;
             rtsp_data->record_last_pts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_base_dts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_base_pts[indx] = AV_NOPTS_VALUE;
         }
 
         mapped_streams = 0;
@@ -367,6 +381,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
                 rtsp_data->record_last_dts = NULL;
                 free(rtsp_data->record_last_pts);
                 rtsp_data->record_last_pts = NULL;
+                free(rtsp_data->record_base_dts);
+                rtsp_data->record_base_dts = NULL;
+                free(rtsp_data->record_base_pts);
+                rtsp_data->record_base_pts = NULL;
                 rtsp_data->record_stream_map_size = 0;
                 pthread_mutex_unlock(&rtsp_data->mutex_record);
                 return -1;
@@ -382,6 +400,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
                 rtsp_data->record_last_dts = NULL;
                 free(rtsp_data->record_last_pts);
                 rtsp_data->record_last_pts = NULL;
+                free(rtsp_data->record_base_dts);
+                rtsp_data->record_base_dts = NULL;
+                free(rtsp_data->record_base_pts);
+                rtsp_data->record_base_pts = NULL;
                 rtsp_data->record_stream_map_size = 0;
                 pthread_mutex_unlock(&rtsp_data->mutex_record);
                 return retcd;
@@ -402,6 +424,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
             rtsp_data->record_last_dts = NULL;
             free(rtsp_data->record_last_pts);
             rtsp_data->record_last_pts = NULL;
+            free(rtsp_data->record_base_dts);
+            rtsp_data->record_base_dts = NULL;
+            free(rtsp_data->record_base_pts);
+            rtsp_data->record_base_pts = NULL;
             rtsp_data->record_stream_map_size = 0;
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
@@ -420,6 +446,10 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
             rtsp_data->record_last_dts = NULL;
             free(rtsp_data->record_last_pts);
             rtsp_data->record_last_pts = NULL;
+            free(rtsp_data->record_base_dts);
+            rtsp_data->record_base_dts = NULL;
+            free(rtsp_data->record_base_pts);
+            rtsp_data->record_base_pts = NULL;
             rtsp_data->record_stream_map_size = 0;
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return retcd;
@@ -1072,6 +1102,8 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
     int64_t pkt_duration;
     int64_t last_dts;
     int64_t last_pts;
+    int64_t base_dts;
+    int64_t base_pts;
     int64_t step;
     AVStream *stream_in;
     AVStream *stream_out;
@@ -1082,6 +1114,8 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
             (rtsp_data->record_stream_map == NULL) ||
             (rtsp_data->record_last_dts == NULL) ||
             (rtsp_data->record_last_pts == NULL) ||
+            (rtsp_data->record_base_dts == NULL) ||
+            (rtsp_data->record_base_pts == NULL) ||
             (packet->stream_index < 0) ||
             (packet->stream_index >= rtsp_data->record_stream_map_size)) {
             pthread_mutex_unlock(&rtsp_data->mutex_record);
@@ -1143,6 +1177,30 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
         }
         if (pkt_duration > 0) {
             pkt_duration = av_rescale_q(pkt_duration, stream_in->time_base, stream_out->time_base);
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            base_dts = rtsp_data->record_base_dts[in_index];
+            if (base_dts == AV_NOPTS_VALUE) {
+                base_dts = pkt_dts;
+                rtsp_data->record_base_dts[in_index] = base_dts;
+            }
+            pkt_dts -= base_dts;
+            if (pkt_dts < 0) {
+                pkt_dts = 0;
+            }
+        }
+
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            base_pts = rtsp_data->record_base_pts[in_index];
+            if (base_pts == AV_NOPTS_VALUE) {
+                base_pts = pkt_pts;
+                rtsp_data->record_base_pts[in_index] = base_pts;
+            }
+            pkt_pts -= base_pts;
+            if (pkt_pts < 0) {
+                pkt_pts = 0;
+            }
         }
 
         if (pkt_dts != AV_NOPTS_VALUE) {
@@ -2041,6 +2099,8 @@ static void netcam_rtsp_set_parms (struct context *cnt, struct rtsp_context *rts
     rtsp_data->record_stream_map_size = 0;
     rtsp_data->record_last_dts = NULL;
     rtsp_data->record_last_pts = NULL;
+    rtsp_data->record_base_dts = NULL;
+    rtsp_data->record_base_pts = NULL;
     rtsp_data->record_active = FALSE;
     rtsp_data->record_pktqueue = NULL;
     rtsp_data->record_pktqueue_size = 0;
