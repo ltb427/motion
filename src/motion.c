@@ -2451,6 +2451,17 @@ static void mlp_actions(struct context *cnt)
         if (cnt->event_nr == cnt->prev_event) {
             /* When prev_event = event_nr, there is currently
              * an event occurring so trigger ending events */
+            int watchdog_saved = cnt->watchdog;
+
+            /*
+             * EVENT_ENDMOTION can run file close handlers and user commands.
+             * Give it extra watchdog budget so normal shutdown is not misread
+             * as a hung thread.
+             */
+            cnt->watchdog = cnt->conf.watchdog_tmo + cnt->conf.watchdog_kill + 5;
+
+            MOTION_LOG(NTC, TYPE_ALL, NO_ERRNO
+                , _("Starting end-of-event %d"), cnt->event_nr);
 
             /* Save preview_shot here at the end of event */
             if (cnt->imgs.preview_image.diffs) {
@@ -2462,6 +2473,12 @@ static void mlp_actions(struct context *cnt)
             }
 
             event(cnt, EVENT_ENDMOTION, NULL, NULL, NULL, &cnt->current_image->timestamp_tv);
+
+            MOTION_LOG(NTC, TYPE_ALL, NO_ERRNO
+                , _("Finished end-of-event handlers %d"), cnt->event_nr);
+
+            /* Restore the normal watchdog baseline for the next loop. */
+            cnt->watchdog = watchdog_saved;
 
             if (cnt->track.type) {
                 cnt->moved = track_center(cnt, cnt->video_dev, 0, 0, 0);

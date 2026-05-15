@@ -438,6 +438,9 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
 void netcam_rtsp_record_stop(struct rtsp_context *rtsp_data)
 {
 
+    int wait_limit;
+    int wait_elapsed = 0;
+
     if (rtsp_data == NULL) {
         return;
     }
@@ -452,9 +455,24 @@ void netcam_rtsp_record_stop(struct rtsp_context *rtsp_data)
         rtsp_data->record_active = FALSE;
     pthread_mutex_unlock(&rtsp_data->mutex_record);
 
+    if ((rtsp_data->cnt != NULL) && (rtsp_data->cnt->conf.watchdog_tmo > 1)) {
+        wait_limit = rtsp_data->cnt->conf.watchdog_tmo - 1;
+    } else {
+        wait_limit = 5;
+    }
+
     pthread_mutex_lock(&rtsp_data->mutex_recordq);
         while (rtsp_data->record_pktqueue_count > 0) {
-            pthread_cond_wait(&rtsp_data->cond_recordq, &rtsp_data->mutex_recordq);
+            if (wait_elapsed >= wait_limit) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Timed out waiting for RTSP event recording to stop; forcing close")
+                    ,rtsp_data->cameratype);
+                break;
+            }
+            pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+            SLEEP(1, 0);
+            wait_elapsed++;
+            pthread_mutex_lock(&rtsp_data->mutex_recordq);
         }
     pthread_mutex_unlock(&rtsp_data->mutex_recordq);
 

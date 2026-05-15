@@ -309,7 +309,7 @@ config_param config_params[] = {
     },
     {
     "watchdog_tmo",
-    "# Watchdog timeout.",
+    "# Watchdog timeout. Also bounds how long Motion waits for RTSP event recording shutdown.",
     1,
     CONF_OFFSET(watchdog_tmo),
     copy_int,
