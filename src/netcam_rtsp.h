@@ -88,6 +88,8 @@ struct imgsize_context {
     #endif
         int                       audio_fft_size;        /* Current FFT window size */
         int                       audio_fft_plan_ready;   /* Whether FFT plan is valid */
+        int                       audio_trigger_hits;     /* Hits accumulated inside debounce window */
+        int64_t                   audio_trigger_last_ts;  /* Last hit timestamp (seconds) */
         pthread_mutex_t           mutex_audio;           /* Mutex protecting audio state */
         pthread_mutex_t           mutex_audioq;          /* Mutex protecting the audio queue */
         pthread_cond_t            cond_audioq;           /* Condition variable used by audio queue */

@@ -57,6 +57,12 @@ struct config {
     const char      *netcam_high_url;
     char            *netcam_high_params;
     const char      *netcam_userpass;
+    int             netcam_audio_detection;
+    int             netcam_audio_band_low;
+    int             netcam_audio_band_high;
+    char            *netcam_audio_trigger_ratio;
+    int             netcam_audio_trigger_window_sec;
+    int             netcam_audio_trigger_hits;
 
     const char      *mmalcam_name;
     const char      *mmalcam_params;

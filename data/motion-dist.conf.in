@@ -39,6 +39,24 @@ video_device /dev/video0
 # The full URL of the network camera stream.
 ; netcam_url value
 
+# Enable RTSP audio analysis and audio-triggered events.
+# This controls only RTSP FFT audio detection. Motion pixel detection is unchanged.
+netcam_audio_detection on
+
+# Upper FFT band edge (Hz) used by RTSP audio detection.
+# Default 3400 works well for speech-band energy; increase for wider-band sounds.
+netcam_audio_band_high 3400
+
+# RTSP audio trigger ratio (band_energy / total_energy).
+# Accepts decimal (0.60) or percent-like value (60). Higher values reduce false triggers.
+netcam_audio_trigger_ratio 0.60
+
+# Debounce window: count trigger hits only within this many seconds.
+netcam_audio_trigger_window_sec 5
+
+# Required hit count inside the debounce window before emitting one audio event.
+netcam_audio_trigger_hits 3
+
 # Name of mmal camera (e.g. vc.ril.camera for pi camera).
 ; mmalcam_name value
 

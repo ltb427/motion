@@ -41,6 +41,7 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include "motion.h"
 #include "translate.h"
 #include "util.h"
@@ -59,9 +60,11 @@
 
 #define RTSP_RECORD_QUEUE_SIZE 512
 #define RTSP_AUDIO_QUEUE_SIZE 512
-#define RTSP_AUDIO_TRIGGER_RATIO 0.10
+#define RTSP_AUDIO_TRIGGER_RATIO 0.60
 #define RTSP_AUDIO_BAND_LOW 300.0
 #define RTSP_AUDIO_BAND_HIGH 3400.0
+#define RTSP_AUDIO_TRIGGER_WINDOW_SEC 5
+#define RTSP_AUDIO_TRIGGER_HITS 3
 
 static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *packet);
 static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet);
@@ -605,7 +608,8 @@ static int netcam_rtsp_audio_enqueue(struct rtsp_context *rtsp_data, AVPacket *p
 
     pthread_mutex_lock(&rtsp_data->mutex_audio);
         if ((!rtsp_data->audio_sync_init) || (rtsp_data->audio_thread_finish) ||
-            (!rtsp_data->cnt->audio_detection_enabled)) {
+            (!rtsp_data->cnt->audio_detection_enabled) ||
+            (!rtsp_data->cnt->conf.netcam_audio_detection)) {
             pthread_mutex_unlock(&rtsp_data->mutex_audio);
             return 0;
         }
@@ -743,14 +747,62 @@ static int netcam_rtsp_audio_analyze_frame(struct rtsp_context *rtsp_data, AVFra
     double total_energy = 0.0;
     double band_energy = 0.0;
     double ratio = 0.0;
+    double trigger_ratio;
     double sample_rate;
     double low_bin;
     double high_bin;
+    double band_low_hz;
+    double band_high_hz;
+    double conf_ratio;
+    const char *ratio_cfg;
+    int trigger_window_sec;
+    int trigger_hits_required;
+    int64_t now_ts;
     int indx;
     const double pi = 3.14159265358979323846;
 
     if ((rtsp_data->audio_swr == NULL) || (frame == NULL) || (frame->nb_samples <= 0)) {
         return 0;
+    }
+
+    if (!rtsp_data->cnt->conf.netcam_audio_detection) {
+        rtsp_data->audio_trigger_hits = 0;
+        rtsp_data->audio_trigger_last_ts = 0;
+        return 0;
+    }
+
+    trigger_ratio = RTSP_AUDIO_TRIGGER_RATIO;
+    ratio_cfg = rtsp_data->cnt->conf.netcam_audio_trigger_ratio;
+    if ((ratio_cfg != NULL) && (ratio_cfg[0] != '\0')) {
+        conf_ratio = atof(ratio_cfg);
+        if ((conf_ratio > 0.0) && (conf_ratio <= 1.0)) {
+            trigger_ratio = conf_ratio;
+        } else if ((conf_ratio > 1.0) && (conf_ratio <= 100.0)) {
+            trigger_ratio = conf_ratio / 100.0;
+        }
+    }
+
+    band_low_hz = RTSP_AUDIO_BAND_LOW;
+    if (rtsp_data->cnt->conf.netcam_audio_band_low > 0) {
+        band_low_hz = (double)rtsp_data->cnt->conf.netcam_audio_band_low;
+    }
+
+    band_high_hz = RTSP_AUDIO_BAND_HIGH;
+    if (rtsp_data->cnt->conf.netcam_audio_band_high > (int)RTSP_AUDIO_BAND_LOW) {
+        band_high_hz = (double)rtsp_data->cnt->conf.netcam_audio_band_high;
+    }
+    if (band_high_hz <= band_low_hz) {
+        band_high_hz = band_low_hz + 1.0;
+    }
+
+    trigger_window_sec = RTSP_AUDIO_TRIGGER_WINDOW_SEC;
+    if (rtsp_data->cnt->conf.netcam_audio_trigger_window_sec > 0) {
+        trigger_window_sec = rtsp_data->cnt->conf.netcam_audio_trigger_window_sec;
+    }
+
+    trigger_hits_required = RTSP_AUDIO_TRIGGER_HITS;
+    if (rtsp_data->cnt->conf.netcam_audio_trigger_hits > 0) {
+        trigger_hits_required = rtsp_data->cnt->conf.netcam_audio_trigger_hits;
     }
 
     out_samples = frame->nb_samples + 32;
@@ -799,8 +851,8 @@ static int netcam_rtsp_audio_analyze_frame(struct rtsp_context *rtsp_data, AVFra
         return 0;
     }
 
-    low_bin = (RTSP_AUDIO_BAND_LOW * converted_samples) / sample_rate;
-    high_bin = (RTSP_AUDIO_BAND_HIGH * converted_samples) / sample_rate;
+    low_bin = (band_low_hz * converted_samples) / sample_rate;
+    high_bin = (band_high_hz * converted_samples) / sample_rate;
     if (high_bin > (converted_samples / 2)) {
         high_bin = converted_samples / 2;
     }
@@ -821,12 +873,29 @@ static int netcam_rtsp_audio_analyze_frame(struct rtsp_context *rtsp_data, AVFra
     }
 
     ratio = band_energy / total_energy;
-    if (ratio >= RTSP_AUDIO_TRIGGER_RATIO) {
-        rtsp_data->cnt->audio_event_user = TRUE;
-        rtsp_data->cnt->event_trigger_source = TRIGGER_SOURCE_AUDIO;
-        MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO
-            ,_("%s: Audio event triggered (band energy ratio %.2f)")
-            , rtsp_data->cameratype, ratio);
+    if (ratio >= trigger_ratio) {
+        now_ts = (int64_t)time(NULL);
+        if ((rtsp_data->audio_trigger_last_ts <= 0) ||
+            ((now_ts - rtsp_data->audio_trigger_last_ts) > trigger_window_sec)) {
+            rtsp_data->audio_trigger_hits = 1;
+        } else {
+            rtsp_data->audio_trigger_hits++;
+        }
+        rtsp_data->audio_trigger_last_ts = now_ts;
+
+        if (rtsp_data->audio_trigger_hits >= trigger_hits_required) {
+            rtsp_data->cnt->audio_event_user = TRUE;
+            rtsp_data->cnt->event_trigger_source = TRIGGER_SOURCE_AUDIO;
+            rtsp_data->audio_trigger_hits = 0;
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Audio event triggered (band energy ratio %.2f, ratio %.2f, %d hits/%ds)")
+                , rtsp_data->cameratype, ratio, trigger_ratio, trigger_hits_required, trigger_window_sec);
+        }
+    } else if (rtsp_data->audio_trigger_last_ts > 0) {
+        now_ts = (int64_t)time(NULL);
+        if ((now_ts - rtsp_data->audio_trigger_last_ts) > trigger_window_sec) {
+            rtsp_data->audio_trigger_hits = 0;
+        }
     }
 
     return 0;
@@ -2597,6 +2666,8 @@ static void netcam_rtsp_set_parms (struct context *cnt, struct rtsp_context *rts
     rtsp_data->audio_fft_out = NULL;
     rtsp_data->audio_fft_size = 0;
     rtsp_data->audio_fft_plan_ready = FALSE;
+    rtsp_data->audio_trigger_hits = 0;
+    rtsp_data->audio_trigger_last_ts = 0;
     rtsp_data->cnt = cnt;
     rtsp_data->src_fps =  -99; /* Default to invalid value so we can test for whether real value exist */
 
