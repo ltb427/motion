@@ -39,6 +39,10 @@ struct imgsize_context {
 
 #ifdef HAVE_FFMPEG
 
+    #ifdef HAVE_FFTW3
+        #include <fftw3.h>
+    #endif
+
     struct packet_item{
         AVPacket                 *packet;
         int64_t                   idnbr;
@@ -58,6 +62,35 @@ struct imgsize_context {
         AVPacket                 *packet_recv;           /* The packet that is currently being processed */
         AVFormatContext          *transfer_format;       /* Format context just for transferring to pass-through */
         AVFormatContext          *record_format;         /* Format context used for event recording */
+        AVCodecContext           *audio_codec_context;   /* Codec context for audio analysis */
+        AVFrame                  *audio_frame;           /* Reusable frame for decoded audio */
+        AVPacket                **audio_pktqueue;        /* Queue of packets pending audio analysis */
+        int                       audio_pktqueue_size;   /* Queue capacity */
+        int                       audio_pktqueue_head;   /* Queue read index */
+        int                       audio_pktqueue_tail;   /* Queue write index */
+        int                       audio_pktqueue_count;  /* Number of queued packets */
+        int                       audio_thread_finish;   /* Request the audio thread to finish */
+        int                       audio_thread_finished; /* Whether audio thread has exited */
+        int                       audio_sync_init;       /* Whether audio mutex/cond are initialized */
+        pthread_t                 audio_thread_id;       /* thread id for audio analysis thread */
+        int                       audio_stream_index;    /* Stream index associated with audio from camera */
+        SwrContext               *audio_swr;             /* Audio resampler to mono double */
+        int                       audio_sample_rate;     /* Audio sample rate */
+        int                       audio_channels;        /* Audio channel count */
+    #ifdef HAVE_FFTW3
+        double                   *audio_fft_in;          /* FFT input buffer */
+        fftw_complex             *audio_fft_out;         /* FFT output buffer */
+        fftw_plan                 audio_fft_plan;        /* FFT plan for current window */
+    #else
+        void                     *audio_fft_in;
+        void                     *audio_fft_out;
+        void                     *audio_fft_plan;
+    #endif
+        int                       audio_fft_size;        /* Current FFT window size */
+        int                       audio_fft_plan_ready;   /* Whether FFT plan is valid */
+        pthread_mutex_t           mutex_audio;           /* Mutex protecting audio state */
+        pthread_mutex_t           mutex_audioq;          /* Mutex protecting the audio queue */
+        pthread_cond_t            cond_audioq;           /* Condition variable used by audio queue */
         int                      *record_stream_map;     /* Input stream index to output stream index */
         int                       record_stream_map_size;/* Number of entries in record_stream_map */
         int64_t                  *record_last_dts;       /* Last written dts for each input stream */

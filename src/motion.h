@@ -29,6 +29,12 @@ struct image_data;
 struct rtsp_context;
 struct ffmpeg;
 
+enum trigger_source {
+    TRIGGER_SOURCE_NONE = 0,
+    TRIGGER_SOURCE_MOTION = 1,
+    TRIGGER_SOURCE_AUDIO = 2
+};
+
 #include "config.h"
 
 /* Includes */
@@ -90,11 +96,14 @@ struct ffmpeg;
     #include <libavformat/avformat.h>
     #include <libavutil/imgutils.h>
     #include <libavutil/mathematics.h>
+    #include <libavutil/samplefmt.h>
+    #include <libavutil/channel_layout.h>
     #include <libavdevice/avdevice.h>
     #include <libavcodec/avcodec.h>
     #include <libavformat/avio.h>
     #include <libavutil/avutil.h>
     #include <libswscale/swscale.h>
+    #include <libswresample/swresample.h>
     #if (MYFFVER >= 57083)
         #include "libavutil/hwcontext.h"
     #endif
@@ -437,6 +446,9 @@ struct context {
 
     int event_nr;
     int prev_event;
+    volatile unsigned int audio_event_user;
+    volatile unsigned int audio_detection_enabled;
+    int event_trigger_source;
     char            eventid[20];        /* Cam ID + Date/Time 99999yyyymmddhhmmss */
     unsigned int lightswitch_framecounter;
     char text_event_string[PATH_MAX];        /* The text for conv. spec. %C - */

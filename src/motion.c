@@ -1063,6 +1063,9 @@ static int motion_init(struct context *cnt)
     cnt->prev_event = 0;
     cnt->lightswitch_framecounter = 0;
     cnt->detecting_motion = 0;
+    cnt->audio_event_user = FALSE;
+    cnt->audio_detection_enabled = TRUE;
+    cnt->event_trigger_source = TRIGGER_SOURCE_NONE;
     cnt->event_user = FALSE;
     cnt->event_stop = FALSE;
 
@@ -2043,7 +2046,6 @@ static int mlp_capture(struct context *cnt)
 static void mlp_detection(struct context *cnt)
 {
 
-
     /***** MOTION LOOP - MOTION DETECTION SECTION *****/
     /*
      * The actual motion detection takes place in the following
@@ -2320,8 +2322,11 @@ static void mlp_actions(struct context *cnt)
 {
 
     int indx;
+    int audio_event_triggered;
 
     /***** MOTION LOOP - ACTIONS AND EVENT CONTROL SECTION *****/
+
+    audio_event_triggered = cnt->audio_event_user;
 
     if ((cnt->current_image->diffs > cnt->threshold) &&
         (cnt->current_image->diffs < cnt->threshold_maximum)) {
@@ -2339,11 +2344,17 @@ static void mlp_actions(struct context *cnt)
      * If post_capture is enabled we also take care of this in the this
      * code section.
      */
-    if ((cnt->conf.emulate_motion || cnt->event_user) && (cnt->startup_frames == 0)) {
+    if ((cnt->conf.emulate_motion || cnt->event_user || audio_event_triggered) && (cnt->startup_frames == 0)) {
         /*  If we were previously detecting motion, started a movie, then got
          *  no motion then we reset the start movie time so that we do not
          *  get a pause in the movie.
         */
+        if (audio_event_triggered) {
+            cnt->event_trigger_source = TRIGGER_SOURCE_AUDIO;
+            cnt->audio_event_user = FALSE;
+        } else {
+            cnt->event_trigger_source = TRIGGER_SOURCE_MOTION;
+        }
         if ( (cnt->detecting_motion == 0) && (cnt->ffmpeg_output != NULL) ) {
             ffmpeg_reset_movie_start_time(cnt->ffmpeg_output, &cnt->current_image->timestamp_tv);
         }
@@ -2390,6 +2401,7 @@ static void mlp_actions(struct context *cnt)
              *  no motion then we reset the start movie time so that we do not
              *  get a pause in the movie.
             */
+            cnt->event_trigger_source = TRIGGER_SOURCE_MOTION;
             if ( (cnt->detecting_motion == 0) && (cnt->ffmpeg_output != NULL) ) {
                 ffmpeg_reset_movie_start_time(cnt->ffmpeg_output, &cnt->current_image->timestamp_tv);
             }
@@ -2491,6 +2503,8 @@ static void mlp_actions(struct context *cnt)
             cnt->lightswitch_framecounter = 0;
             cnt->text_event_string[0] = '\0';
             cnt->event_nr++;
+            cnt->event_trigger_source = TRIGGER_SOURCE_NONE;
+            cnt->audio_event_user = FALSE;
         }
         cnt->event_stop = FALSE;
         cnt->event_user = FALSE;

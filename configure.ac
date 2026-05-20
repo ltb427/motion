@@ -271,7 +271,7 @@ AS_IF([test "${FFMPEG}" = "no"], [
     export PKG_CONFIG_PATH
     AC_MSG_RESULT($PKG_CONFIG_PATH)
 
-    FFMPEG_DEPS="libavutil libavformat libavcodec libswscale libavdevice"
+    FFMPEG_DEPS="libavutil libavformat libavcodec libswscale libswresample libavdevice"
     AC_MSG_CHECKING(for FFmpeg)
     AS_IF([pkg-config $FFMPEG_DEPS], [
         FFMPEG_VER=`pkg-config --modversion libavformat`
@@ -281,11 +281,33 @@ AS_IF([test "${FFMPEG}" = "no"], [
         AC_MSG_RESULT(yes)
       ],[
         AC_MSG_RESULT(no)
-        AC_MSG_ERROR([Required ffmpeg packages 'libavutil-dev libavformat-dev libavcodec-dev libswscale-dev libavdevice-dev' were not found.  Please check motion_guide.html and install necessary dependencies or use the '--without-ffmpeg' configuration option.])
+        AC_MSG_ERROR([Required ffmpeg packages 'libavutil-dev libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavdevice-dev' were not found.  Please check motion_guide.html and install necessary dependencies or use the '--without-ffmpeg' configuration option.])
       ]
     )
     PKG_CONFIG_PATH=$TEMP_PATH
     export PKG_CONFIG_PATH
+  ]
+)
+
+##############################################################################
+###  Check for FFTW3 - Required for audio analysis over RTSP streams.
+##############################################################################
+AS_IF([pkg-config fftw3 ], [
+    TEMP_CFLAGS="$TEMP_CFLAGS "`pkg-config --cflags fftw3`
+    TEMP_LIBS="$TEMP_LIBS "`pkg-config --libs fftw3`
+    AC_DEFINE([HAVE_FFTW3], [1], [Define to 1 if FFTW3 is around])
+  ],[
+    AC_MSG_ERROR([Required package 'libfftw3-dev' was not found.  Please install it to enable RTSP audio analysis.])
+  ]
+)
+
+##############################################################################
+###  Check for libm - Required by cosine windowing used in audio FFT.
+##############################################################################
+AC_CHECK_LIB([m], [cos], [
+    TEMP_LIBS="$TEMP_LIBS -lm"
+  ],[
+    AC_MSG_ERROR([Required math library 'libm' was not found.])
   ]
 )
 
