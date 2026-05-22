@@ -289,7 +289,11 @@ static void on_event_end_command(struct context *cnt, motion_event eventtype
     (void)tv1;
 
     if (cnt->conf.on_event_end) {
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: running on_event_end command for event %d"), cnt->event_nr);
         exec_command(cnt, cnt->conf.on_event_end, NULL, 0);
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: on_event_end command finished for event %d"), cnt->event_nr);
     }
 }
 
@@ -753,6 +757,8 @@ static void event_extpipe_end(struct context *cnt, motion_event eventtype
     (void)eventdata;
 
     if (cnt->extpipe_open) {
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: closing extpipe for event %d"), cnt->event_nr);
         cnt->extpipe_open = 0;
         fflush(cnt->extpipe);
         MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
@@ -760,6 +766,8 @@ static void event_extpipe_end(struct context *cnt, motion_event eventtype
             ,fileno(cnt->extpipe), ferror(cnt->extpipe));
         MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO, _("pclose return: %d"),
                    pclose(cnt->extpipe));
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: extpipe close finished for event %d"), cnt->event_nr);
         event(cnt, EVENT_FILECLOSE, NULL, cnt->extpipefilename, (void *)FTYPE_MPEG, tv1);
     }
 }
@@ -1212,16 +1220,24 @@ static void event_ffmpeg_closefile(struct context *cnt, motion_event eventtype
     (void)eventdata;
 
     if (cnt->ffmpeg_output) {
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: closing ffmpeg main output for event %d"), cnt->event_nr);
         ffmpeg_close(cnt->ffmpeg_output);
         free(cnt->ffmpeg_output);
         cnt->ffmpeg_output = NULL;
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: ffmpeg main output close finished for event %d"), cnt->event_nr);
         event(cnt, EVENT_FILECLOSE, NULL, cnt->newfilename, (void *)FTYPE_MPEG, tv1);
     }
 
     if (cnt->ffmpeg_output_motion) {
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: closing ffmpeg motion output for event %d"), cnt->event_nr);
         ffmpeg_close(cnt->ffmpeg_output_motion);
         free(cnt->ffmpeg_output_motion);
         cnt->ffmpeg_output_motion = NULL;
+        MOTION_LOG(NTC, TYPE_EVENTS, NO_ERRNO
+            , _("EVENT_ENDMOTION: ffmpeg motion output close finished for event %d"), cnt->event_nr);
         event(cnt, EVENT_FILECLOSE, NULL, cnt->motionfilename, (void *)FTYPE_MPEG_MOTION, tv1);
     }
 

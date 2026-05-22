@@ -40,6 +40,8 @@
  ***********************************************************/
 
 #include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
 #include "motion.h"
 #include "translate.h"
 #include "util.h"
@@ -48,9 +50,33 @@
 #include "netcam.h"
 #include "netcam_rtsp.h"
 
+#ifdef HAVE_FFTW3
+#include <fftw3.h>
+#endif
+
 #ifdef HAVE_FFMPEG
 
 #include "ffmpeg.h"
+
+#define RTSP_RECORD_QUEUE_SIZE 512
+#define RTSP_AUDIO_QUEUE_SIZE 512
+#define RTSP_AUDIO_TRIGGER_RATIO 0.60
+#define RTSP_AUDIO_BAND_LOW 300.0
+#define RTSP_AUDIO_BAND_HIGH 3400.0
+#define RTSP_AUDIO_TRIGGER_WINDOW_SEC 5
+#define RTSP_AUDIO_TRIGGER_HITS 3
+
+static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *packet);
+static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet);
+static void *netcam_rtsp_record_handler(void *arg);
+static int netcam_rtsp_audio_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet);
+static void *netcam_rtsp_audio_handler(void *arg);
+
+static int netcam_rtsp_valid_timebase(AVRational tb)
+{
+
+    return ((tb.num > 0) && (tb.den > 0));
+}
 
 static void netcam_rtsp_free_pkt(struct rtsp_context *rtsp_data)
 {
@@ -104,11 +130,84 @@ static void netcam_rtsp_null_context(struct rtsp_context *rtsp_data)
     rtsp_data->codec_context   = NULL;
     rtsp_data->format_context  = NULL;
     rtsp_data->transfer_format = NULL;
+    rtsp_data->record_format   = NULL;
+    rtsp_data->record_stream_map = NULL;
+    rtsp_data->record_stream_map_size = 0;
+    rtsp_data->record_last_dts = NULL;
+    rtsp_data->record_last_pts = NULL;
+    rtsp_data->record_base_dts = NULL;
+    rtsp_data->record_base_pts = NULL;
+    rtsp_data->record_active   = FALSE;
 
+}
+
+static void netcam_rtsp_record_close_lck(struct rtsp_context *rtsp_data)
+{
+
+    if (rtsp_data->record_format != NULL) {
+        av_write_trailer(rtsp_data->record_format);
+        if (rtsp_data->record_format->pb != NULL) {
+            avio_close(rtsp_data->record_format->pb);
+        }
+        avformat_free_context(rtsp_data->record_format);
+        rtsp_data->record_format = NULL;
+    }
+    if (rtsp_data->record_stream_map != NULL) {
+        free(rtsp_data->record_stream_map);
+        rtsp_data->record_stream_map = NULL;
+    }
+    if (rtsp_data->record_last_dts != NULL) {
+        free(rtsp_data->record_last_dts);
+        rtsp_data->record_last_dts = NULL;
+    }
+    if (rtsp_data->record_last_pts != NULL) {
+        free(rtsp_data->record_last_pts);
+        rtsp_data->record_last_pts = NULL;
+    }
+    if (rtsp_data->record_base_dts != NULL) {
+        free(rtsp_data->record_base_dts);
+        rtsp_data->record_base_dts = NULL;
+    }
+    if (rtsp_data->record_base_pts != NULL) {
+        free(rtsp_data->record_base_pts);
+        rtsp_data->record_base_pts = NULL;
+    }
+    rtsp_data->record_stream_map_size = 0;
+}
+
+static void netcam_rtsp_record_queue_clear_lck(struct rtsp_context *rtsp_data)
+{
+
+    AVPacket *pkt;
+
+    if ((rtsp_data->record_pktqueue == NULL) || (rtsp_data->record_pktqueue_size < 1)) {
+        rtsp_data->record_pktqueue_head = 0;
+        rtsp_data->record_pktqueue_tail = 0;
+        rtsp_data->record_pktqueue_count = 0;
+        pthread_cond_broadcast(&rtsp_data->cond_recordq);
+        return;
+    }
+
+    while (rtsp_data->record_pktqueue_count > 0) {
+        pkt = rtsp_data->record_pktqueue[rtsp_data->record_pktqueue_head];
+        rtsp_data->record_pktqueue[rtsp_data->record_pktqueue_head] = NULL;
+        rtsp_data->record_pktqueue_head =
+            (rtsp_data->record_pktqueue_head + 1) % rtsp_data->record_pktqueue_size;
+        rtsp_data->record_pktqueue_count--;
+        if (pkt != NULL) {
+            my_packet_free(pkt);
+        }
+    }
+
+    rtsp_data->record_pktqueue_head = 0;
+    rtsp_data->record_pktqueue_tail = 0;
+    pthread_cond_broadcast(&rtsp_data->cond_recordq);
 }
 
 static void netcam_rtsp_close_context(struct rtsp_context *rtsp_data)
 {
+
+    netcam_rtsp_record_stop(rtsp_data);
 
     if (rtsp_data->swsctx != NULL) {
         sws_freeContext(rtsp_data->swsctx);
@@ -139,6 +238,855 @@ static void netcam_rtsp_close_context(struct rtsp_context *rtsp_data)
     #endif
     netcam_rtsp_null_context(rtsp_data);
 
+}
+
+static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet)
+{
+
+    AVPacket *pkt_copy;
+
+    pthread_mutex_lock(&rtsp_data->mutex_record);
+        if (!rtsp_data->record_active) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+    pthread_mutex_unlock(&rtsp_data->mutex_record);
+
+    pkt_copy = my_packet_alloc(NULL);
+    if (my_copy_packet(pkt_copy, packet) < 0) {
+        my_packet_free(pkt_copy);
+        return -1;
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_recordq);
+        if ((rtsp_data->record_pktqueue == NULL) || (rtsp_data->record_pktqueue_size < 1)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+            my_packet_free(pkt_copy);
+            return -1;
+        }
+
+        if (rtsp_data->record_pktqueue_count >= rtsp_data->record_pktqueue_size) {
+            pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+            my_packet_free(pkt_copy);
+            MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Event record queue full; dropping packet"), rtsp_data->cameratype);
+            return 0;
+        }
+
+        rtsp_data->record_pktqueue[rtsp_data->record_pktqueue_tail] = pkt_copy;
+        rtsp_data->record_pktqueue_tail =
+            (rtsp_data->record_pktqueue_tail + 1) % rtsp_data->record_pktqueue_size;
+        rtsp_data->record_pktqueue_count++;
+        pthread_cond_signal(&rtsp_data->cond_recordq);
+    pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+    return 0;
+}
+
+int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filename)
+{
+
+    int indx;
+    int retcd;
+    int mapped_streams;
+    AVFormatContext *record_format;
+    AVStream *stream_in;
+    AVStream *stream_out;
+
+    if ((rtsp_data == NULL) || (filename == NULL)) {
+        return -1;
+    }
+
+    if (!rtsp_data->record_sync_init) {
+        return -1;
+    }
+
+    netcam_rtsp_record_stop(rtsp_data);
+
+    pthread_mutex_lock(&rtsp_data->mutex_record);
+        if (rtsp_data->format_context == NULL) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return -1;
+        }
+
+        if (mycreate_path(filename) != 0) {
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Could not create path for %s")
+                ,rtsp_data->cameratype, filename);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return -1;
+        }
+
+        record_format = NULL;
+        retcd = avformat_alloc_output_context2(&record_format, NULL, "mp4", filename);
+        if ((retcd < 0) || (record_format == NULL)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return (retcd < 0) ? retcd : -1;
+        }
+
+        retcd = avio_open(&record_format->pb, filename, MY_FLAG_WRITE);
+        if (retcd < 0) {
+            avformat_free_context(record_format);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return retcd;
+        }
+
+        rtsp_data->record_stream_map_size = rtsp_data->format_context->nb_streams;
+        if (rtsp_data->record_stream_map_size <= 0) {
+            avio_close(record_format->pb);
+            avformat_free_context(record_format);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Camera stream list is empty; cannot start mp4 recording")
+                ,rtsp_data->cameratype);
+            return -1;
+        }
+
+        rtsp_data->record_stream_map = mymalloc(sizeof(int) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_last_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_last_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_base_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        rtsp_data->record_base_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
+        for (indx = 0; indx < rtsp_data->record_stream_map_size; indx++) {
+            rtsp_data->record_stream_map[indx] = -1;
+            rtsp_data->record_last_dts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_last_pts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_base_dts[indx] = AV_NOPTS_VALUE;
+            rtsp_data->record_base_pts[indx] = AV_NOPTS_VALUE;
+        }
+
+        mapped_streams = 0;
+        for (indx = 0; indx < rtsp_data->format_context->nb_streams; indx++) {
+            stream_in = rtsp_data->format_context->streams[indx];
+            if ((stream_in == NULL) || (stream_in->codecpar == NULL)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping invalid stream metadata (stream %d)")
+                    ,rtsp_data->cameratype, indx);
+                continue;
+            }
+
+            if ((stream_in->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) &&
+                (stream_in->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)) {
+                continue;
+            }
+
+            if (!netcam_rtsp_valid_timebase(stream_in->time_base)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping stream with invalid time base (stream %d)")
+                    ,rtsp_data->cameratype, indx);
+                continue;
+            }
+
+            if (!avformat_query_codec(record_format->oformat
+                , stream_in->codecpar->codec_id, FF_COMPLIANCE_NORMAL)) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Skipping unsupported codec for mp4 (stream %d, codec_id=%d)")
+                    ,rtsp_data->cameratype, indx, stream_in->codecpar->codec_id);
+                continue;
+            }
+
+            stream_out = avformat_new_stream(record_format, NULL);
+            if (stream_out == NULL) {
+                avio_close(record_format->pb);
+                avformat_free_context(record_format);
+                free(rtsp_data->record_stream_map);
+                rtsp_data->record_stream_map = NULL;
+                free(rtsp_data->record_last_dts);
+                rtsp_data->record_last_dts = NULL;
+                free(rtsp_data->record_last_pts);
+                rtsp_data->record_last_pts = NULL;
+                free(rtsp_data->record_base_dts);
+                rtsp_data->record_base_dts = NULL;
+                free(rtsp_data->record_base_pts);
+                rtsp_data->record_base_pts = NULL;
+                rtsp_data->record_stream_map_size = 0;
+                pthread_mutex_unlock(&rtsp_data->mutex_record);
+                return -1;
+            }
+
+            retcd = avcodec_parameters_copy(stream_out->codecpar, stream_in->codecpar);
+            if (retcd < 0) {
+                avio_close(record_format->pb);
+                avformat_free_context(record_format);
+                free(rtsp_data->record_stream_map);
+                rtsp_data->record_stream_map = NULL;
+                free(rtsp_data->record_last_dts);
+                rtsp_data->record_last_dts = NULL;
+                free(rtsp_data->record_last_pts);
+                rtsp_data->record_last_pts = NULL;
+                free(rtsp_data->record_base_dts);
+                rtsp_data->record_base_dts = NULL;
+                free(rtsp_data->record_base_pts);
+                rtsp_data->record_base_pts = NULL;
+                rtsp_data->record_stream_map_size = 0;
+                pthread_mutex_unlock(&rtsp_data->mutex_record);
+                return retcd;
+            }
+
+            stream_out->codecpar->codec_tag = 0;
+            stream_out->time_base = stream_in->time_base;
+            rtsp_data->record_stream_map[indx] = stream_out->index;
+            mapped_streams++;
+        }
+
+        if (mapped_streams == 0) {
+            avio_close(record_format->pb);
+            avformat_free_context(record_format);
+            free(rtsp_data->record_stream_map);
+            rtsp_data->record_stream_map = NULL;
+            free(rtsp_data->record_last_dts);
+            rtsp_data->record_last_dts = NULL;
+            free(rtsp_data->record_last_pts);
+            rtsp_data->record_last_pts = NULL;
+            free(rtsp_data->record_base_dts);
+            rtsp_data->record_base_dts = NULL;
+            free(rtsp_data->record_base_pts);
+            rtsp_data->record_base_pts = NULL;
+            rtsp_data->record_stream_map_size = 0;
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: No mp4-compatible streams found for event recording")
+                ,rtsp_data->cameratype);
+            return -1;
+        }
+
+        retcd = avformat_write_header(record_format, NULL);
+        if (retcd < 0) {
+            avio_close(record_format->pb);
+            avformat_free_context(record_format);
+            free(rtsp_data->record_stream_map);
+            rtsp_data->record_stream_map = NULL;
+            free(rtsp_data->record_last_dts);
+            rtsp_data->record_last_dts = NULL;
+            free(rtsp_data->record_last_pts);
+            rtsp_data->record_last_pts = NULL;
+            free(rtsp_data->record_base_dts);
+            rtsp_data->record_base_dts = NULL;
+            free(rtsp_data->record_base_pts);
+            rtsp_data->record_base_pts = NULL;
+            rtsp_data->record_stream_map_size = 0;
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return retcd;
+        }
+
+        rtsp_data->record_format = record_format;
+        rtsp_data->record_active = TRUE;
+    pthread_mutex_unlock(&rtsp_data->mutex_record);
+
+    MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO
+        ,_("%s: Recording event mp4 to %s"), rtsp_data->cameratype, filename);
+
+    return 0;
+}
+
+void netcam_rtsp_record_stop(struct rtsp_context *rtsp_data)
+{
+
+    int wait_limit;
+    int wait_elapsed = 0;
+
+    if (rtsp_data == NULL) {
+        return;
+    }
+
+    if (!rtsp_data->record_sync_init) {
+        rtsp_data->record_active = FALSE;
+        netcam_rtsp_record_close_lck(rtsp_data);
+        return;
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_record);
+        rtsp_data->record_active = FALSE;
+    pthread_mutex_unlock(&rtsp_data->mutex_record);
+
+    if ((rtsp_data->cnt != NULL) && (rtsp_data->cnt->conf.watchdog_tmo > 1)) {
+        wait_limit = rtsp_data->cnt->conf.watchdog_tmo - 1;
+    } else {
+        wait_limit = 5;
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_recordq);
+        while (rtsp_data->record_pktqueue_count > 0) {
+            if (wait_elapsed >= wait_limit) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Timed out waiting for RTSP event recording to stop; forcing close")
+                    ,rtsp_data->cameratype);
+                break;
+            }
+            pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+            SLEEP(1, 0);
+            wait_elapsed++;
+            pthread_mutex_lock(&rtsp_data->mutex_recordq);
+        }
+    pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+    pthread_mutex_lock(&rtsp_data->mutex_record);
+        netcam_rtsp_record_close_lck(rtsp_data);
+    pthread_mutex_unlock(&rtsp_data->mutex_record);
+}
+
+static void *netcam_rtsp_record_handler(void *arg)
+{
+
+    struct rtsp_context *rtsp_data = arg;
+    AVPacket *pkt;
+
+    util_threadname_set("nr", rtsp_data->threadnbr, rtsp_data->camera_name);
+
+    pthread_mutex_lock(&rtsp_data->mutex_recordq);
+        rtsp_data->record_thread_finished = FALSE;
+    pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+    while (TRUE) {
+        pthread_mutex_lock(&rtsp_data->mutex_recordq);
+            while ((rtsp_data->record_pktqueue_count == 0) && (!rtsp_data->record_thread_finish)) {
+                pthread_cond_wait(&rtsp_data->cond_recordq, &rtsp_data->mutex_recordq);
+            }
+
+            if ((rtsp_data->record_pktqueue_count == 0) && (rtsp_data->record_thread_finish)) {
+                pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+                break;
+            }
+
+            pkt = rtsp_data->record_pktqueue[rtsp_data->record_pktqueue_head];
+            rtsp_data->record_pktqueue[rtsp_data->record_pktqueue_head] = NULL;
+            rtsp_data->record_pktqueue_head =
+                (rtsp_data->record_pktqueue_head + 1) % rtsp_data->record_pktqueue_size;
+            rtsp_data->record_pktqueue_count--;
+            if (rtsp_data->record_pktqueue_count == 0) {
+                pthread_cond_broadcast(&rtsp_data->cond_recordq);
+            }
+        pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+        if (pkt != NULL) {
+            netcam_rtsp_record_write(rtsp_data, pkt);
+            my_packet_free(pkt);
+        }
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_recordq);
+        rtsp_data->record_thread_finished = TRUE;
+        pthread_cond_broadcast(&rtsp_data->cond_recordq);
+    pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+    pthread_exit(NULL);
+}
+
+static void netcam_rtsp_audio_queue_clear_lck(struct rtsp_context *rtsp_data)
+{
+
+    AVPacket *pkt;
+
+    if ((rtsp_data->audio_pktqueue == NULL) || (rtsp_data->audio_pktqueue_size < 1)) {
+        rtsp_data->audio_pktqueue_head = 0;
+        rtsp_data->audio_pktqueue_tail = 0;
+        rtsp_data->audio_pktqueue_count = 0;
+        pthread_cond_broadcast(&rtsp_data->cond_audioq);
+        return;
+    }
+
+    while (rtsp_data->audio_pktqueue_count > 0) {
+        pkt = rtsp_data->audio_pktqueue[rtsp_data->audio_pktqueue_head];
+        rtsp_data->audio_pktqueue[rtsp_data->audio_pktqueue_head] = NULL;
+        rtsp_data->audio_pktqueue_head =
+            (rtsp_data->audio_pktqueue_head + 1) % rtsp_data->audio_pktqueue_size;
+        rtsp_data->audio_pktqueue_count--;
+        if (pkt != NULL) {
+            my_packet_free(pkt);
+        }
+    }
+
+    rtsp_data->audio_pktqueue_head = 0;
+    rtsp_data->audio_pktqueue_tail = 0;
+    pthread_cond_broadcast(&rtsp_data->cond_audioq);
+}
+
+static int netcam_rtsp_audio_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet)
+{
+
+    AVPacket *pkt_copy;
+
+    pthread_mutex_lock(&rtsp_data->mutex_audio);
+        if ((!rtsp_data->audio_sync_init) || (rtsp_data->audio_thread_finish) ||
+            (!rtsp_data->cnt->audio_detection_enabled) ||
+            (!rtsp_data->cnt->conf.netcam_audio_detection)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_audio);
+            return 0;
+        }
+    pthread_mutex_unlock(&rtsp_data->mutex_audio);
+
+    pkt_copy = my_packet_alloc(NULL);
+    if (my_copy_packet(pkt_copy, packet) < 0) {
+        my_packet_free(pkt_copy);
+        return -1;
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_audioq);
+        if ((rtsp_data->audio_pktqueue == NULL) || (rtsp_data->audio_pktqueue_size < 1)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+            my_packet_free(pkt_copy);
+            return -1;
+        }
+
+        if (rtsp_data->audio_pktqueue_count >= rtsp_data->audio_pktqueue_size) {
+            pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+            my_packet_free(pkt_copy);
+            MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Audio queue full; dropping packet"), rtsp_data->cameratype);
+            return 0;
+        }
+
+        rtsp_data->audio_pktqueue[rtsp_data->audio_pktqueue_tail] = pkt_copy;
+        rtsp_data->audio_pktqueue_tail =
+            (rtsp_data->audio_pktqueue_tail + 1) % rtsp_data->audio_pktqueue_size;
+        rtsp_data->audio_pktqueue_count++;
+        pthread_cond_signal(&rtsp_data->cond_audioq);
+    pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+    return 0;
+}
+
+static void netcam_rtsp_audio_close_lck(struct rtsp_context *rtsp_data)
+{
+
+#ifdef HAVE_FFTW3
+    if (rtsp_data->audio_fft_plan_ready) {
+        fftw_destroy_plan(rtsp_data->audio_fft_plan);
+        rtsp_data->audio_fft_plan_ready = FALSE;
+    }
+    if (rtsp_data->audio_fft_in != NULL) {
+        fftw_free(rtsp_data->audio_fft_in);
+        rtsp_data->audio_fft_in = NULL;
+    }
+    if (rtsp_data->audio_fft_out != NULL) {
+        fftw_free(rtsp_data->audio_fft_out);
+        rtsp_data->audio_fft_out = NULL;
+    }
+#endif
+    rtsp_data->audio_fft_size = 0;
+
+    if (rtsp_data->audio_swr != NULL) {
+        swr_free(&rtsp_data->audio_swr);
+    }
+    if (rtsp_data->audio_codec_context != NULL) {
+        my_avcodec_close(rtsp_data->audio_codec_context);
+        rtsp_data->audio_codec_context = NULL;
+    }
+    if (rtsp_data->audio_frame != NULL) {
+        my_frame_free(rtsp_data->audio_frame);
+        rtsp_data->audio_frame = NULL;
+    }
+}
+
+static int netcam_rtsp_audio_prepare_fft(struct rtsp_context *rtsp_data, int sample_count)
+{
+
+#ifdef HAVE_FFTW3
+    if ((sample_count < 2) || (sample_count == rtsp_data->audio_fft_size && rtsp_data->audio_fft_plan_ready)) {
+        return 0;
+    }
+
+    if (rtsp_data->audio_fft_plan_ready) {
+        fftw_destroy_plan(rtsp_data->audio_fft_plan);
+        rtsp_data->audio_fft_plan_ready = FALSE;
+    }
+    if (rtsp_data->audio_fft_in != NULL) {
+        fftw_free(rtsp_data->audio_fft_in);
+        rtsp_data->audio_fft_in = NULL;
+    }
+    if (rtsp_data->audio_fft_out != NULL) {
+        fftw_free(rtsp_data->audio_fft_out);
+        rtsp_data->audio_fft_out = NULL;
+    }
+
+    rtsp_data->audio_fft_in = fftw_malloc(sizeof(double) * sample_count);
+    rtsp_data->audio_fft_out = fftw_malloc(sizeof(fftw_complex) * (sample_count / 2 + 1));
+    if ((rtsp_data->audio_fft_in == NULL) || (rtsp_data->audio_fft_out == NULL)) {
+        if (rtsp_data->audio_fft_in != NULL) {
+            fftw_free(rtsp_data->audio_fft_in);
+            rtsp_data->audio_fft_in = NULL;
+        }
+        if (rtsp_data->audio_fft_out != NULL) {
+            fftw_free(rtsp_data->audio_fft_out);
+            rtsp_data->audio_fft_out = NULL;
+        }
+        rtsp_data->audio_fft_size = 0;
+        return -1;
+    }
+
+    rtsp_data->audio_fft_plan = fftw_plan_dft_r2c_1d(sample_count, rtsp_data->audio_fft_in,
+                                                     rtsp_data->audio_fft_out, FFTW_ESTIMATE);
+    if (rtsp_data->audio_fft_plan == NULL) {
+        fftw_free(rtsp_data->audio_fft_in);
+        fftw_free(rtsp_data->audio_fft_out);
+        rtsp_data->audio_fft_in = NULL;
+        rtsp_data->audio_fft_out = NULL;
+        rtsp_data->audio_fft_size = 0;
+        return -1;
+    }
+
+    rtsp_data->audio_fft_size = sample_count;
+    rtsp_data->audio_fft_plan_ready = TRUE;
+    return 0;
+#else
+    (void)rtsp_data;
+    (void)sample_count;
+    return -1;
+#endif
+}
+
+static int netcam_rtsp_audio_analyze_frame(struct rtsp_context *rtsp_data, AVFrame *frame)
+{
+
+#ifdef HAVE_FFTW3
+    int converted_samples;
+    int out_samples;
+    int channel_layout;
+    uint8_t **out_data = NULL;
+    int out_linesize = 0;
+    double total_energy = 0.0;
+    double band_energy = 0.0;
+    double ratio = 0.0;
+    double trigger_ratio;
+    double sample_rate;
+    double low_bin;
+    double high_bin;
+    double band_low_hz;
+    double band_high_hz;
+    double conf_ratio;
+    const char *ratio_cfg;
+    int trigger_window_sec;
+    int trigger_hits_required;
+    int64_t now_ts;
+    int indx;
+    const double pi = 3.14159265358979323846;
+
+    if ((rtsp_data->audio_swr == NULL) || (frame == NULL) || (frame->nb_samples <= 0)) {
+        return 0;
+    }
+
+    if (!rtsp_data->cnt->conf.netcam_audio_detection) {
+        rtsp_data->audio_trigger_hits = 0;
+        rtsp_data->audio_trigger_last_ts = 0;
+        return 0;
+    }
+
+    trigger_ratio = RTSP_AUDIO_TRIGGER_RATIO;
+    ratio_cfg = rtsp_data->cnt->conf.netcam_audio_trigger_ratio;
+    if ((ratio_cfg != NULL) && (ratio_cfg[0] != '\0')) {
+        conf_ratio = atof(ratio_cfg);
+        if ((conf_ratio > 0.0) && (conf_ratio <= 1.0)) {
+            trigger_ratio = conf_ratio;
+        } else if ((conf_ratio > 1.0) && (conf_ratio <= 100.0)) {
+            trigger_ratio = conf_ratio / 100.0;
+        }
+    }
+
+    band_low_hz = RTSP_AUDIO_BAND_LOW;
+    if (rtsp_data->cnt->conf.netcam_audio_band_low > 0) {
+        band_low_hz = (double)rtsp_data->cnt->conf.netcam_audio_band_low;
+    }
+
+    band_high_hz = RTSP_AUDIO_BAND_HIGH;
+    if (rtsp_data->cnt->conf.netcam_audio_band_high > (int)RTSP_AUDIO_BAND_LOW) {
+        band_high_hz = (double)rtsp_data->cnt->conf.netcam_audio_band_high;
+    }
+    if (band_high_hz <= band_low_hz) {
+        band_high_hz = band_low_hz + 1.0;
+    }
+
+    trigger_window_sec = RTSP_AUDIO_TRIGGER_WINDOW_SEC;
+    if (rtsp_data->cnt->conf.netcam_audio_trigger_window_sec > 0) {
+        trigger_window_sec = rtsp_data->cnt->conf.netcam_audio_trigger_window_sec;
+    }
+
+    trigger_hits_required = RTSP_AUDIO_TRIGGER_HITS;
+    if (rtsp_data->cnt->conf.netcam_audio_trigger_hits > 0) {
+        trigger_hits_required = rtsp_data->cnt->conf.netcam_audio_trigger_hits;
+    }
+
+    out_samples = frame->nb_samples + 32;
+    if (netcam_rtsp_audio_prepare_fft(rtsp_data, out_samples) < 0) {
+        return -1;
+    }
+
+    if (av_samples_alloc_array_and_samples(&out_data, &out_linesize, 1, out_samples,
+                                           AV_SAMPLE_FMT_DBL, 0) < 0) {
+        return -1;
+    }
+
+    converted_samples = swr_convert(rtsp_data->audio_swr, out_data, out_samples,
+                                    (const uint8_t **)frame->extended_data, frame->nb_samples);
+    if (converted_samples <= 0) {
+        av_freep(&out_data[0]);
+        av_freep(&out_data);
+        return 0;
+    }
+
+    if (converted_samples < 2) {
+        av_freep(&out_data[0]);
+        av_freep(&out_data);
+        return 0;
+    }
+
+    if (netcam_rtsp_audio_prepare_fft(rtsp_data, converted_samples) < 0) {
+        av_freep(&out_data[0]);
+        av_freep(&out_data);
+        return -1;
+    }
+
+    memcpy(rtsp_data->audio_fft_in, out_data[0], sizeof(double) * converted_samples);
+    av_freep(&out_data[0]);
+    av_freep(&out_data);
+
+    for (indx = 0; indx < converted_samples; indx++) {
+        double window = 0.5 * (1.0 - cos((2.0 * pi * indx) / (converted_samples - 1)));
+        rtsp_data->audio_fft_in[indx] *= window;
+    }
+
+    fftw_execute(rtsp_data->audio_fft_plan);
+
+    sample_rate = (double)rtsp_data->audio_sample_rate;
+    if (sample_rate <= 0.0) {
+        return 0;
+    }
+
+    low_bin = (band_low_hz * converted_samples) / sample_rate;
+    high_bin = (band_high_hz * converted_samples) / sample_rate;
+    if (high_bin > (converted_samples / 2)) {
+        high_bin = converted_samples / 2;
+    }
+
+    for (indx = 1; indx <= (converted_samples / 2); indx++) {
+        double real = rtsp_data->audio_fft_out[indx][0];
+        double imag = rtsp_data->audio_fft_out[indx][1];
+        double energy = real * real + imag * imag;
+
+        total_energy += energy;
+        if (((double)indx >= low_bin) && ((double)indx <= high_bin)) {
+            band_energy += energy;
+        }
+    }
+
+    if (total_energy <= 0.0) {
+        return 0;
+    }
+
+    ratio = band_energy / total_energy;
+    if (ratio >= trigger_ratio) {
+        now_ts = (int64_t)time(NULL);
+        if ((rtsp_data->audio_trigger_last_ts <= 0) ||
+            ((now_ts - rtsp_data->audio_trigger_last_ts) > trigger_window_sec)) {
+            rtsp_data->audio_trigger_hits = 1;
+        } else {
+            rtsp_data->audio_trigger_hits++;
+        }
+        rtsp_data->audio_trigger_last_ts = now_ts;
+
+        if (rtsp_data->audio_trigger_hits >= trigger_hits_required) {
+            rtsp_data->cnt->audio_event_user = TRUE;
+            rtsp_data->cnt->event_trigger_source = TRIGGER_SOURCE_AUDIO;
+            rtsp_data->audio_trigger_hits = 0;
+            MOTION_LOG(NTC, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Audio event triggered (band energy ratio %.2f, ratio %.2f, %d hits/%ds)")
+                , rtsp_data->cameratype, ratio, trigger_ratio, trigger_hits_required, trigger_window_sec);
+        }
+    } else if (rtsp_data->audio_trigger_last_ts > 0) {
+        now_ts = (int64_t)time(NULL);
+        if ((now_ts - rtsp_data->audio_trigger_last_ts) > trigger_window_sec) {
+            rtsp_data->audio_trigger_hits = 0;
+        }
+    }
+
+    return 0;
+#else
+    (void)rtsp_data;
+    (void)frame;
+    return -1;
+#endif
+}
+
+static int netcam_rtsp_audio_open_codec(struct rtsp_context *rtsp_data)
+{
+
+#if ( MYFFVER >= 57041)
+    int retcd;
+    my_AVCodec *audio_decoder = NULL;
+    int64_t channel_layout;
+
+    if ((rtsp_data == NULL) || (rtsp_data->format_context == NULL) ||
+        (rtsp_data->format_context->nb_streams <= 0) ||
+        (rtsp_data->format_context->streams == NULL)) {
+        MOTION_LOG(DBG, TYPE_NETCAM, NO_ERRNO
+            ,_("%s: Audio stream context not ready yet")
+            , rtsp_data ? rtsp_data->cameratype : _("unknown"));
+        return 0;
+    }
+
+    rtsp_data->audio_stream_index = -1;
+    retcd = av_find_best_stream(rtsp_data->format_context, AVMEDIA_TYPE_AUDIO, -1, -1,
+                                &audio_decoder, 0);
+    if (retcd < 0) {
+        MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO
+            ,_("%s: No audio stream found; audio analysis disabled")
+            , rtsp_data->cameratype);
+        return 0;
+    }
+
+    rtsp_data->audio_stream_index = retcd;
+
+    rtsp_data->audio_codec_context = avcodec_alloc_context3(audio_decoder);
+    if (rtsp_data->audio_codec_context == NULL) {
+        return -1;
+    }
+
+    retcd = avcodec_parameters_to_context(rtsp_data->audio_codec_context,
+                                          rtsp_data->format_context->streams[rtsp_data->audio_stream_index]->codecpar);
+    if (retcd < 0) {
+        return -1;
+    }
+
+    retcd = avcodec_open2(rtsp_data->audio_codec_context, audio_decoder, NULL);
+    if (retcd < 0) {
+        return -1;
+    }
+
+    rtsp_data->audio_frame = my_frame_alloc();
+    if (rtsp_data->audio_frame == NULL) {
+        return -1;
+    }
+
+    rtsp_data->audio_sample_rate = rtsp_data->audio_codec_context->sample_rate;
+    if (rtsp_data->audio_sample_rate <= 0) {
+        rtsp_data->audio_sample_rate = rtsp_data->format_context->streams[rtsp_data->audio_stream_index]->codecpar->sample_rate;
+    }
+    if (rtsp_data->audio_sample_rate <= 0) {
+        MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+            ,_("%s: Audio stream has no sample rate; audio analysis disabled")
+            , rtsp_data->cameratype);
+        return -1;
+    }
+
+    rtsp_data->audio_channels = rtsp_data->audio_codec_context->channels;
+    if (rtsp_data->audio_channels <= 0) {
+        rtsp_data->audio_channels = av_get_channel_layout_nb_channels(rtsp_data->audio_codec_context->channel_layout);
+    }
+    if (rtsp_data->audio_channels <= 0) {
+        rtsp_data->audio_channels = 1;
+    }
+
+    channel_layout = rtsp_data->audio_codec_context->channel_layout;
+    if (channel_layout == 0) {
+        channel_layout = av_get_default_channel_layout(rtsp_data->audio_channels);
+    }
+
+    rtsp_data->audio_swr = swr_alloc_set_opts(NULL,
+        AV_CH_LAYOUT_MONO,
+        AV_SAMPLE_FMT_DBL,
+        rtsp_data->audio_sample_rate,
+        channel_layout,
+        rtsp_data->audio_codec_context->sample_fmt,
+        rtsp_data->audio_sample_rate,
+        0,
+        NULL);
+    if (rtsp_data->audio_swr == NULL) {
+        return -1;
+    }
+
+    retcd = swr_init(rtsp_data->audio_swr);
+    if (retcd < 0) {
+        return -1;
+    }
+
+    MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO
+        ,_("%s: Audio stream opened for frequency analysis (stream %d)")
+        , rtsp_data->cameratype, rtsp_data->audio_stream_index);
+    return 0;
+#else
+    (void)rtsp_data;
+    return 0;
+#endif
+}
+
+static void *netcam_rtsp_audio_handler(void *arg)
+{
+
+    struct rtsp_context *rtsp_data = arg;
+    AVPacket *pkt;
+    int retcd;
+
+    util_threadname_set("na", rtsp_data->threadnbr, rtsp_data->camera_name);
+
+    pthread_mutex_lock(&rtsp_data->mutex_audioq);
+        rtsp_data->audio_thread_finished = FALSE;
+    pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+    while (TRUE) {
+        if ((rtsp_data->audio_stream_index < 0) && (!rtsp_data->audio_thread_finish)) {
+            /* Re-try codec open after reconnect/late stream availability. */
+            retcd = netcam_rtsp_audio_open_codec(rtsp_data);
+            if (retcd < 0) {
+                pthread_mutex_lock(&rtsp_data->mutex_audioq);
+                    rtsp_data->audio_thread_finished = TRUE;
+                    pthread_cond_broadcast(&rtsp_data->cond_audioq);
+                pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+                pthread_exit(NULL);
+            }
+            /* Avoid tight CPU spin while waiting for audio stream availability. */
+            SLEEP(0, 200000000);
+            continue;
+        }
+        pthread_mutex_lock(&rtsp_data->mutex_audioq);
+            while ((rtsp_data->audio_pktqueue_count == 0) && (!rtsp_data->audio_thread_finish)) {
+                pthread_cond_wait(&rtsp_data->cond_audioq, &rtsp_data->mutex_audioq);
+            }
+
+            if ((rtsp_data->audio_pktqueue_count == 0) && (rtsp_data->audio_thread_finish)) {
+                pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+                break;
+            }
+
+            pkt = rtsp_data->audio_pktqueue[rtsp_data->audio_pktqueue_head];
+            rtsp_data->audio_pktqueue[rtsp_data->audio_pktqueue_head] = NULL;
+            rtsp_data->audio_pktqueue_head =
+                (rtsp_data->audio_pktqueue_head + 1) % rtsp_data->audio_pktqueue_size;
+            rtsp_data->audio_pktqueue_count--;
+            if (rtsp_data->audio_pktqueue_count == 0) {
+                pthread_cond_broadcast(&rtsp_data->cond_audioq);
+            }
+        pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+        if (pkt != NULL) {
+            if (pkt->stream_index == rtsp_data->audio_stream_index) {
+#if ( MYFFVER >= 57041)
+                if (rtsp_data->audio_codec_context != NULL) {
+                    int send_ret = avcodec_send_packet(rtsp_data->audio_codec_context, pkt);
+                    if ((send_ret >= 0) || (send_ret == AVERROR(EAGAIN))) {
+                        while (TRUE) {
+                            int frame_ret = avcodec_receive_frame(rtsp_data->audio_codec_context, rtsp_data->audio_frame);
+                            if (frame_ret == 0) {
+                                netcam_rtsp_audio_analyze_frame(rtsp_data, rtsp_data->audio_frame);
+                                av_frame_unref(rtsp_data->audio_frame);
+                            } else if ((frame_ret == AVERROR(EAGAIN)) || (frame_ret == AVERROR_EOF)) {
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+#endif
+            }
+            my_packet_free(pkt);
+        }
+    }
+
+    pthread_mutex_lock(&rtsp_data->mutex_audioq);
+        rtsp_data->audio_thread_finished = TRUE;
+        pthread_cond_broadcast(&rtsp_data->cond_audioq);
+    pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+    pthread_exit(NULL);
 }
 
 static void netcam_rtsp_pktarray_resize(struct context *cnt, int is_highres)
@@ -674,6 +1622,161 @@ static void netcam_rtsp_decoder_error(struct rtsp_context *rtsp_data, int retcd,
 
 }
 
+static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *packet)
+{
+
+    int retcd;
+    int in_index;
+    int out_index;
+    int64_t pkt_dts;
+    int64_t pkt_pts;
+    int64_t pkt_duration;
+    int64_t last_dts;
+    int64_t last_pts;
+    int64_t base_dts;
+    int64_t base_pts;
+    int64_t step;
+    AVStream *stream_in;
+    AVStream *stream_out;
+
+    pthread_mutex_lock(&rtsp_data->mutex_record);
+        if ((rtsp_data->record_format == NULL) ||
+            (rtsp_data->format_context == NULL) ||
+            (rtsp_data->record_stream_map == NULL) ||
+            (rtsp_data->record_last_dts == NULL) ||
+            (rtsp_data->record_last_pts == NULL) ||
+            (rtsp_data->record_base_dts == NULL) ||
+            (rtsp_data->record_base_pts == NULL) ||
+            (packet->stream_index < 0) ||
+            (packet->stream_index >= rtsp_data->record_stream_map_size)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        in_index = packet->stream_index;
+        out_index = rtsp_data->record_stream_map[in_index];
+
+        if (out_index < 0) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        if ((in_index >= rtsp_data->format_context->nb_streams) ||
+            (out_index >= rtsp_data->record_format->nb_streams)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        stream_in = rtsp_data->format_context->streams[in_index];
+        stream_out = rtsp_data->record_format->streams[out_index];
+        if ((stream_in == NULL) || (stream_out == NULL)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+        if ((!netcam_rtsp_valid_timebase(stream_in->time_base)) ||
+            (!netcam_rtsp_valid_timebase(stream_out->time_base))) {
+            MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Dropping packet due to invalid stream time base")
+                ,rtsp_data->cameratype);
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        pkt_dts = packet->dts;
+        pkt_pts = packet->pts;
+        pkt_duration = packet->duration;
+
+        if ((pkt_dts == AV_NOPTS_VALUE) && (pkt_pts != AV_NOPTS_VALUE)) {
+            pkt_dts = pkt_pts;
+        }
+        if ((pkt_pts == AV_NOPTS_VALUE) && (pkt_dts != AV_NOPTS_VALUE)) {
+            pkt_pts = pkt_dts;
+        }
+
+        if ((pkt_dts == AV_NOPTS_VALUE) && (pkt_pts == AV_NOPTS_VALUE)) {
+            pthread_mutex_unlock(&rtsp_data->mutex_record);
+            return 0;
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            pkt_dts = av_rescale_q_rnd(pkt_dts, stream_in->time_base, stream_out->time_base
+                ,AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        }
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            pkt_pts = av_rescale_q_rnd(pkt_pts, stream_in->time_base, stream_out->time_base
+                ,AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        }
+        if (pkt_duration > 0) {
+            pkt_duration = av_rescale_q(pkt_duration, stream_in->time_base, stream_out->time_base);
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            base_dts = rtsp_data->record_base_dts[in_index];
+            if (base_dts == AV_NOPTS_VALUE) {
+                base_dts = pkt_dts;
+                rtsp_data->record_base_dts[in_index] = base_dts;
+            }
+            pkt_dts -= base_dts;
+            if (pkt_dts < 0) {
+                pkt_dts = 0;
+            }
+        }
+
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            base_pts = rtsp_data->record_base_pts[in_index];
+            if (base_pts == AV_NOPTS_VALUE) {
+                base_pts = pkt_pts;
+                rtsp_data->record_base_pts[in_index] = base_pts;
+            }
+            pkt_pts -= base_pts;
+            if (pkt_pts < 0) {
+                pkt_pts = 0;
+            }
+        }
+
+        if (pkt_dts != AV_NOPTS_VALUE) {
+            last_dts = rtsp_data->record_last_dts[in_index];
+            if ((last_dts != AV_NOPTS_VALUE) && (pkt_dts <= last_dts)) {
+                step = (pkt_duration > 0) ? pkt_duration : 1;
+                pkt_dts = last_dts + step;
+            }
+            rtsp_data->record_last_dts[in_index] = pkt_dts;
+        }
+
+        if (pkt_pts != AV_NOPTS_VALUE) {
+            last_pts = rtsp_data->record_last_pts[in_index];
+            if ((last_pts != AV_NOPTS_VALUE) && (pkt_pts <= last_pts)) {
+                step = (pkt_duration > 0) ? pkt_duration : 1;
+                pkt_pts = last_pts + step;
+            }
+            if ((pkt_dts != AV_NOPTS_VALUE) && (pkt_pts < pkt_dts)) {
+                pkt_pts = pkt_dts;
+            }
+            rtsp_data->record_last_pts[in_index] = pkt_pts;
+        }
+
+        packet->dts = pkt_dts;
+        packet->pts = pkt_pts;
+        packet->duration = (pkt_duration > 0) ? pkt_duration : 0;
+        packet->stream_index = out_index;
+        packet->pos = -1;
+
+        retcd = av_interleaved_write_frame(rtsp_data->record_format, packet);
+        if (retcd < 0) {
+            char errstr[128];
+
+            av_strerror(retcd, errstr, sizeof(errstr));
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: Error writing mp4 packet: %s")
+                ,rtsp_data->cameratype, errstr);
+            rtsp_data->record_active = FALSE;
+            netcam_rtsp_record_close_lck(rtsp_data);
+        }
+    pthread_mutex_unlock(&rtsp_data->mutex_record);
+
+    return retcd;
+}
+
 static int netcam_init_vaapi(struct rtsp_context *rtsp_data)
 {
 
@@ -1187,6 +2290,14 @@ static int netcam_rtsp_read_image(struct rtsp_context *rtsp_data)
             netcam_rtsp_close_context(rtsp_data);
             return -1;
         } else {
+            if (rtsp_data->record_active) {
+                retcd = netcam_rtsp_record_enqueue(rtsp_data, rtsp_data->packet_recv);
+                if (retcd < 0) {
+                    /* Queueing failed; keep capture alive and continue image processing. */
+                    retcd = 0;
+                }
+            }
+
             if (rtsp_data->packet_recv->stream_index == rtsp_data->video_stream_index) {
                 /* For a high resolution pass-through we don't decode the image */
                 if (rtsp_data->high_resolution && rtsp_data->passthrough) {
@@ -1196,11 +2307,23 @@ static int netcam_rtsp_read_image(struct rtsp_context *rtsp_data)
                 } else {
                     size_decoded = netcam_rtsp_decode_packet(rtsp_data);
                 }
+            } else if ((rtsp_data->packet_recv->stream_index == rtsp_data->audio_stream_index) &&
+                       rtsp_data->audio_sync_init) {
+                if (netcam_rtsp_audio_enqueue(rtsp_data, rtsp_data->packet_recv) < 0) {
+                    MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                        ,_("%s: Failed to enqueue audio packet")
+                        , rtsp_data->cameratype);
+                }
             }
 
-            if (size_decoded > 0 ) {
+            if (size_decoded > 0) {
                 haveimage = TRUE;
             } else if (size_decoded == 0) {
+                if (rtsp_data->packet_recv->stream_index != rtsp_data->video_stream_index) {
+                    netcam_rtsp_free_pkt(rtsp_data);
+                    rtsp_data->packet_recv = my_packet_alloc(rtsp_data->packet_recv);
+                    continue;
+                }
                 /* Did not fail, just didn't get anything.  Try again */
                 nodata++;
                 netcam_rtsp_free_pkt(rtsp_data);
@@ -1340,7 +2463,6 @@ static void netcam_rtsp_set_options(struct rtsp_context *rtsp_data)
         MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO,_("%s: Setting rtsp/rtmp")
             ,rtsp_data->cameratype);
         util_parms_add_default(rtsp_data->parameters,"rtsp_transport","tcp");
-        util_parms_add_default(rtsp_data->parameters,"allowed_media_types", "video");
 
     } else if (strncmp(rtsp_data->service, "http", 4) == 0 ) {
         MOTION_LOG(INF, TYPE_NETCAM, NO_ERRNO
@@ -1510,6 +2632,42 @@ static void netcam_rtsp_set_parms (struct context *cnt, struct rtsp_context *rts
     rtsp_data->handler_finished = TRUE;
     rtsp_data->first_image = TRUE;
     rtsp_data->reconnect_count = 0;
+    rtsp_data->record_format = NULL;
+    rtsp_data->record_stream_map = NULL;
+    rtsp_data->record_stream_map_size = 0;
+    rtsp_data->record_last_dts = NULL;
+    rtsp_data->record_last_pts = NULL;
+    rtsp_data->record_base_dts = NULL;
+    rtsp_data->record_base_pts = NULL;
+    rtsp_data->record_active = FALSE;
+    rtsp_data->record_pktqueue = NULL;
+    rtsp_data->record_pktqueue_size = 0;
+    rtsp_data->record_pktqueue_head = 0;
+    rtsp_data->record_pktqueue_tail = 0;
+    rtsp_data->record_pktqueue_count = 0;
+    rtsp_data->record_thread_finish = FALSE;
+    rtsp_data->record_thread_finished = TRUE;
+    rtsp_data->record_sync_init = FALSE;
+    rtsp_data->audio_codec_context = NULL;
+    rtsp_data->audio_frame = NULL;
+    rtsp_data->audio_pktqueue = NULL;
+    rtsp_data->audio_pktqueue_size = 0;
+    rtsp_data->audio_pktqueue_head = 0;
+    rtsp_data->audio_pktqueue_tail = 0;
+    rtsp_data->audio_pktqueue_count = 0;
+    rtsp_data->audio_thread_finish = FALSE;
+    rtsp_data->audio_thread_finished = TRUE;
+    rtsp_data->audio_sync_init = FALSE;
+    rtsp_data->audio_stream_index = -1;
+    rtsp_data->audio_swr = NULL;
+    rtsp_data->audio_sample_rate = 0;
+    rtsp_data->audio_channels = 0;
+    rtsp_data->audio_fft_in = NULL;
+    rtsp_data->audio_fft_out = NULL;
+    rtsp_data->audio_fft_size = 0;
+    rtsp_data->audio_fft_plan_ready = FALSE;
+    rtsp_data->audio_trigger_hits = 0;
+    rtsp_data->audio_trigger_last_ts = 0;
     rtsp_data->cnt = cnt;
     rtsp_data->src_fps =  -99; /* Default to invalid value so we can test for whether real value exist */
 
@@ -1843,6 +3001,51 @@ static void netcam_rtsp_shutdown(struct rtsp_context *rtsp_data)
 {
 
     if (rtsp_data) {
+        if (rtsp_data->audio_sync_init) {
+            int wait_limit;
+            int wait_elapsed = 0;
+
+            pthread_mutex_lock(&rtsp_data->mutex_audioq);
+                rtsp_data->audio_thread_finish = TRUE;
+                pthread_cond_broadcast(&rtsp_data->cond_audioq);
+            pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+            if ((rtsp_data->cnt != NULL) && (rtsp_data->cnt->conf.watchdog_tmo > 1)) {
+                wait_limit = rtsp_data->cnt->conf.watchdog_tmo - 1;
+            } else {
+                wait_limit = 5;
+            }
+
+            pthread_mutex_lock(&rtsp_data->mutex_audioq);
+                while ((!rtsp_data->audio_thread_finished) && (wait_elapsed < wait_limit)) {
+                    pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+                    SLEEP(1,0);
+                    wait_elapsed++;
+                    pthread_mutex_lock(&rtsp_data->mutex_audioq);
+                }
+            pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+            if (!rtsp_data->audio_thread_finished) {
+                MOTION_LOG(WRN, TYPE_NETCAM, NO_ERRNO
+                    ,_("%s: Timed out waiting for RTSP audio analysis to stop; forcing close")
+                    , rtsp_data->cameratype);
+            }
+
+            pthread_mutex_lock(&rtsp_data->mutex_audioq);
+                netcam_rtsp_audio_queue_clear_lck(rtsp_data);
+            pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+
+            pthread_mutex_lock(&rtsp_data->mutex_audio);
+                netcam_rtsp_audio_close_lck(rtsp_data);
+            pthread_mutex_unlock(&rtsp_data->mutex_audio);
+
+            if (rtsp_data->audio_pktqueue != NULL) {
+                free(rtsp_data->audio_pktqueue);
+                rtsp_data->audio_pktqueue = NULL;
+            }
+            rtsp_data->audio_pktqueue_size = 0;
+        }
+
         netcam_rtsp_close_context(rtsp_data);
 
         if (rtsp_data->path != NULL) {
@@ -2003,23 +3206,95 @@ static int netcam_rtsp_start_handler(struct rtsp_context *rtsp_data)
 
     int retcd, wait_counter;
     pthread_attr_t handler_attribute;
+    pthread_attr_t record_attribute;
+    pthread_attr_t audio_attribute;
 
     pthread_mutex_init(&rtsp_data->mutex, NULL);
     pthread_mutex_init(&rtsp_data->mutex_pktarray, NULL);
     pthread_mutex_init(&rtsp_data->mutex_transfer, NULL);
+    pthread_mutex_init(&rtsp_data->mutex_record, NULL);
+    pthread_mutex_init(&rtsp_data->mutex_recordq, NULL);
+    pthread_cond_init(&rtsp_data->cond_recordq, NULL);
+    rtsp_data->record_sync_init = TRUE;
+
+    pthread_mutex_init(&rtsp_data->mutex_audio, NULL);
+    pthread_mutex_init(&rtsp_data->mutex_audioq, NULL);
+    pthread_cond_init(&rtsp_data->cond_audioq, NULL);
+    rtsp_data->audio_sync_init = TRUE;
+
+    rtsp_data->record_pktqueue_size = RTSP_RECORD_QUEUE_SIZE;
+    rtsp_data->record_pktqueue = mymalloc(sizeof(AVPacket *) * rtsp_data->record_pktqueue_size);
+    memset(rtsp_data->record_pktqueue, 0, sizeof(AVPacket *) * rtsp_data->record_pktqueue_size);
+    rtsp_data->record_pktqueue_head = 0;
+    rtsp_data->record_pktqueue_tail = 0;
+    rtsp_data->record_pktqueue_count = 0;
+    rtsp_data->record_thread_finish = FALSE;
+    rtsp_data->record_thread_finished = FALSE;
+
+    rtsp_data->audio_pktqueue_size = RTSP_AUDIO_QUEUE_SIZE;
+    rtsp_data->audio_pktqueue = mymalloc(sizeof(AVPacket *) * rtsp_data->audio_pktqueue_size);
+    memset(rtsp_data->audio_pktqueue, 0, sizeof(AVPacket *) * rtsp_data->audio_pktqueue_size);
+    rtsp_data->audio_pktqueue_head = 0;
+    rtsp_data->audio_pktqueue_tail = 0;
+    rtsp_data->audio_pktqueue_count = 0;
+    rtsp_data->audio_thread_finish = FALSE;
+    rtsp_data->audio_thread_finished = FALSE;
 
     pthread_attr_init(&handler_attribute);
     pthread_attr_setdetachstate(&handler_attribute, PTHREAD_CREATE_DETACHED);
 
+    pthread_attr_init(&record_attribute);
+    pthread_attr_setdetachstate(&record_attribute, PTHREAD_CREATE_DETACHED);
+
+    pthread_attr_init(&audio_attribute);
+    pthread_attr_setdetachstate(&audio_attribute, PTHREAD_CREATE_DETACHED);
+
     pthread_mutex_lock(&global_lock);
         rtsp_data->threadnbr = ++threads_running;
     pthread_mutex_unlock(&global_lock);
+
+    retcd = pthread_create(&rtsp_data->record_thread_id, &record_attribute, &netcam_rtsp_record_handler, rtsp_data);
+    if (retcd < 0) {
+        MOTION_LOG(ALR, TYPE_NETCAM, SHOW_ERRNO
+            ,_("%s: Error starting record thread"),rtsp_data->cameratype);
+        pthread_attr_destroy(&handler_attribute);
+        pthread_attr_destroy(&record_attribute);
+        pthread_attr_destroy(&audio_attribute);
+        return -1;
+    }
+    pthread_attr_destroy(&record_attribute);
+
+    retcd = pthread_create(&rtsp_data->audio_thread_id, &audio_attribute, &netcam_rtsp_audio_handler, rtsp_data);
+    if (retcd < 0) {
+        MOTION_LOG(ALR, TYPE_NETCAM, SHOW_ERRNO
+            ,_("%s: Error starting audio thread"),rtsp_data->cameratype);
+        pthread_attr_destroy(&handler_attribute);
+        pthread_attr_destroy(&audio_attribute);
+        pthread_mutex_lock(&rtsp_data->mutex_recordq);
+            rtsp_data->record_thread_finish = TRUE;
+            pthread_cond_broadcast(&rtsp_data->cond_recordq);
+        pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+        pthread_mutex_lock(&rtsp_data->mutex_audioq);
+            rtsp_data->audio_thread_finish = TRUE;
+            pthread_cond_broadcast(&rtsp_data->cond_audioq);
+        pthread_mutex_unlock(&rtsp_data->mutex_audioq);
+        return -1;
+    }
+    pthread_attr_destroy(&audio_attribute);
 
     retcd = pthread_create(&rtsp_data->thread_id, &handler_attribute, &netcam_rtsp_handler, rtsp_data);
     if (retcd < 0) {
         MOTION_LOG(ALR, TYPE_NETCAM, SHOW_ERRNO
             ,_("%s: Error starting handler thread"),rtsp_data->cameratype);
         pthread_attr_destroy(&handler_attribute);
+        pthread_mutex_lock(&rtsp_data->mutex_recordq);
+            rtsp_data->record_thread_finish = TRUE;
+            pthread_cond_broadcast(&rtsp_data->cond_recordq);
+        pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+        pthread_mutex_lock(&rtsp_data->mutex_audioq);
+            rtsp_data->audio_thread_finish = TRUE;
+            pthread_cond_broadcast(&rtsp_data->cond_audioq);
+        pthread_mutex_unlock(&rtsp_data->mutex_audioq);
         return -1;
     }
     pthread_attr_destroy(&handler_attribute);
@@ -2225,6 +3500,10 @@ void netcam_rtsp_cleanup(struct context *cnt, int init_retry_flag)
                 */
                 rtsp_data->finish = TRUE;
                 rtsp_data->interruptduration = 0;
+                pthread_mutex_lock(&rtsp_data->mutex_recordq);
+                    rtsp_data->record_thread_finish = TRUE;
+                    pthread_cond_broadcast(&rtsp_data->cond_recordq);
+                pthread_mutex_unlock(&rtsp_data->mutex_recordq);
                 wait_counter = 0;
                 while ((!rtsp_data->handler_finished) && (wait_counter < 10)) {
                     SLEEP(1,0);
@@ -2243,12 +3522,39 @@ void netcam_rtsp_cleanup(struct context *cnt, int init_retry_flag)
                         pthread_mutex_unlock(&global_lock);
                     }
                 }
+
+                wait_counter = 0;
+                while ((!rtsp_data->record_thread_finished) && (wait_counter < 10)) {
+                    SLEEP(1,0);
+                    wait_counter++;
+                }
+
                 /* If we never connect we don't have a handler but we still need to clean up some */
                 netcam_rtsp_shutdown(rtsp_data);
+
+                pthread_mutex_lock(&rtsp_data->mutex_recordq);
+                    netcam_rtsp_record_queue_clear_lck(rtsp_data);
+                pthread_mutex_unlock(&rtsp_data->mutex_recordq);
+
+                if (rtsp_data->record_pktqueue != NULL) {
+                    free(rtsp_data->record_pktqueue);
+                    rtsp_data->record_pktqueue = NULL;
+                }
+                rtsp_data->record_pktqueue_size = 0;
 
                 pthread_mutex_destroy(&rtsp_data->mutex);
                 pthread_mutex_destroy(&rtsp_data->mutex_pktarray);
                 pthread_mutex_destroy(&rtsp_data->mutex_transfer);
+                pthread_mutex_destroy(&rtsp_data->mutex_record);
+                pthread_mutex_destroy(&rtsp_data->mutex_recordq);
+                if (rtsp_data->audio_sync_init) {
+                    pthread_mutex_destroy(&rtsp_data->mutex_audio);
+                    pthread_mutex_destroy(&rtsp_data->mutex_audioq);
+                    pthread_cond_destroy(&rtsp_data->cond_audioq);
+                    rtsp_data->audio_sync_init = FALSE;
+                }
+                pthread_cond_destroy(&rtsp_data->cond_recordq);
+                rtsp_data->record_sync_init = FALSE;
 
                 free(rtsp_data);
                 rtsp_data = NULL;

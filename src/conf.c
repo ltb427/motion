@@ -67,6 +67,12 @@ struct config conf_template = {
     .netcam_high_url=                  NULL,
     .netcam_high_params =              NULL,
     .netcam_userpass =                 NULL,
+    .netcam_audio_detection =          TRUE,
+    .netcam_audio_band_low =           300,
+    .netcam_audio_band_high =          3400,
+    .netcam_audio_trigger_ratio =      "0.60",
+    .netcam_audio_trigger_window_sec = 5,
+    .netcam_audio_trigger_hits =       3,
 
     .mmalcam_name =                    NULL,
     .mmalcam_params =                  NULL,
@@ -309,7 +315,7 @@ config_param config_params[] = {
     },
     {
     "watchdog_tmo",
-    "# Watchdog timeout.",
+    "# Watchdog timeout. Also bounds how long Motion waits for RTSP event recording shutdown.",
     1,
     CONF_OFFSET(watchdog_tmo),
     copy_int,
@@ -459,6 +465,60 @@ config_param config_params[] = {
     CONF_OFFSET(netcam_userpass),
     copy_string,
     print_string,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_detection",
+    "# Enable RTSP audio analysis and audio-triggered events.",
+    0,
+    CONF_OFFSET(netcam_audio_detection),
+    copy_bool,
+    print_bool,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_band_low",
+    "# Lower band edge in Hz used for RTSP audio FFT trigger detection.",
+    0,
+    CONF_OFFSET(netcam_audio_band_low),
+    copy_int,
+    print_int,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_band_high",
+    "# Upper band edge in Hz used for RTSP audio FFT trigger detection.",
+    0,
+    CONF_OFFSET(netcam_audio_band_high),
+    copy_int,
+    print_int,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_trigger_ratio",
+    "# FFT band-energy trigger ratio (0.0..1.0). Example: 0.60",
+    0,
+    CONF_OFFSET(netcam_audio_trigger_ratio),
+    copy_string,
+    print_string,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_trigger_window_sec",
+    "# Trigger window in seconds for accumulating RTSP audio FFT hits.",
+    0,
+    CONF_OFFSET(netcam_audio_trigger_window_sec),
+    copy_int,
+    print_int,
+    WEBUI_LEVEL_ADVANCED
+    },
+    {
+    "netcam_audio_trigger_hits",
+    "# Number of FFT hits required inside window to trigger an audio event.",
+    0,
+    CONF_OFFSET(netcam_audio_trigger_hits),
+    copy_int,
+    print_int,
     WEBUI_LEVEL_ADVANCED
     },
     {
@@ -3272,6 +3332,12 @@ static void config_parms_intl()
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_high_url",_("netcam_high_url"));
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_high_params",_("netcam_high_params"));
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_userpass",_("netcam_userpass"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_detection",_("netcam_audio_detection"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_band_low",_("netcam_audio_band_low"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_band_high",_("netcam_audio_band_high"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_trigger_ratio",_("netcam_audio_trigger_ratio"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_trigger_window_sec",_("netcam_audio_trigger_window_sec"));
+        MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","netcam_audio_trigger_hits",_("netcam_audio_trigger_hits"));
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","mmalcam_name",_("mmalcam_name"));
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","mmalcam_params",_("mmalcam_params"));
         MOTION_LOG(DBG, TYPE_ALL, NO_ERRNO,"%s:%s","width",_("width"));

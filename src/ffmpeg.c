@@ -1429,14 +1429,21 @@ int ffmpeg_open(struct ffmpeg *ffmpeg)
         }
 
         if (ffmpeg->passthrough) {
-            retcd = ffmpeg_passthru_codec(ffmpeg);
+            retcd = ffmpeg_get_oformat(ffmpeg);
             if (retcd < 0 ) {
-                MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, _("Could not setup passthru!"));
+                MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, _("Could not get codec!"));
                 ffmpeg_free_context(ffmpeg);
                 return -1;
             }
 
-            ffmpeg_passthru_reset(ffmpeg);
+            if ((ffmpeg->rtsp_data == NULL) ||
+                (netcam_rtsp_record_start(ffmpeg->rtsp_data, ffmpeg->filename) < 0)) {
+                MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, _("Could not start RTSP event recording!"));
+                ffmpeg_free_context(ffmpeg);
+                return -1;
+            }
+
+            return 0;
 
         } else {
             retcd = ffmpeg_get_oformat(ffmpeg);
@@ -1485,6 +1492,14 @@ void ffmpeg_close(struct ffmpeg *ffmpeg)
     #ifdef HAVE_FFMPEG
 
         if (ffmpeg != NULL) {
+            if (ffmpeg->passthrough) {
+                if (ffmpeg->rtsp_data != NULL) {
+                    netcam_rtsp_record_stop(ffmpeg->rtsp_data);
+                }
+                ffmpeg_free_context(ffmpeg);
+                ffmpeg_free_nal(ffmpeg);
+                return;
+            }
 
             if (ffmpeg_flush_codec(ffmpeg) < 0) {
                 MOTION_LOG(ERR, TYPE_ENCODER, NO_ERRNO, _("Error flushing codec"));
@@ -1515,8 +1530,9 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, struct image_data *img_data, const s
         int cnt = 0;
 
         if (ffmpeg->passthrough) {
-            retcd = ffmpeg_passthru_put(ffmpeg, img_data);
-            return retcd;
+            (void)img_data;
+            (void)tv1;
+            return 0;
         }
 
         if (ffmpeg->picture) {
@@ -1572,6 +1588,12 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, struct image_data *img_data, const s
 void ffmpeg_reset_movie_start_time(struct ffmpeg *ffmpeg, const struct timeval *tv1)
 {
     #ifdef HAVE_FFMPEG
+        if ((ffmpeg == NULL) || (tv1 == NULL) ||
+            (ffmpeg->passthrough) || (ffmpeg->video_st == NULL) ||
+            (ffmpeg->fps <= 0)) {
+            return;
+        }
+
         int64_t one_frame_interval = av_rescale_q(1,(AVRational){1, ffmpeg->fps},ffmpeg->video_st->time_base);
         if (one_frame_interval <= 0) {
             one_frame_interval = 1;

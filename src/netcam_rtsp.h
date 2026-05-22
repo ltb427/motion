@@ -39,6 +39,10 @@ struct imgsize_context {
 
 #ifdef HAVE_FFMPEG
 
+    #ifdef HAVE_FFTW3
+        #include <fftw3.h>
+    #endif
+
     struct packet_item{
         AVPacket                 *packet;
         int64_t                   idnbr;
@@ -57,6 +61,53 @@ struct imgsize_context {
         struct SwsContext        *swsctx;                /* Context for the resizing of the image */
         AVPacket                 *packet_recv;           /* The packet that is currently being processed */
         AVFormatContext          *transfer_format;       /* Format context just for transferring to pass-through */
+        AVFormatContext          *record_format;         /* Format context used for event recording */
+        AVCodecContext           *audio_codec_context;   /* Codec context for audio analysis */
+        AVFrame                  *audio_frame;           /* Reusable frame for decoded audio */
+        AVPacket                **audio_pktqueue;        /* Queue of packets pending audio analysis */
+        int                       audio_pktqueue_size;   /* Queue capacity */
+        int                       audio_pktqueue_head;   /* Queue read index */
+        int                       audio_pktqueue_tail;   /* Queue write index */
+        int                       audio_pktqueue_count;  /* Number of queued packets */
+        int                       audio_thread_finish;   /* Request the audio thread to finish */
+        int                       audio_thread_finished; /* Whether audio thread has exited */
+        int                       audio_sync_init;       /* Whether audio mutex/cond are initialized */
+        pthread_t                 audio_thread_id;       /* thread id for audio analysis thread */
+        int                       audio_stream_index;    /* Stream index associated with audio from camera */
+        SwrContext               *audio_swr;             /* Audio resampler to mono double */
+        int                       audio_sample_rate;     /* Audio sample rate */
+        int                       audio_channels;        /* Audio channel count */
+    #ifdef HAVE_FFTW3
+        double                   *audio_fft_in;          /* FFT input buffer */
+        fftw_complex             *audio_fft_out;         /* FFT output buffer */
+        fftw_plan                 audio_fft_plan;        /* FFT plan for current window */
+    #else
+        void                     *audio_fft_in;
+        void                     *audio_fft_out;
+        void                     *audio_fft_plan;
+    #endif
+        int                       audio_fft_size;        /* Current FFT window size */
+        int                       audio_fft_plan_ready;   /* Whether FFT plan is valid */
+        int                       audio_trigger_hits;     /* Hits accumulated inside debounce window */
+        int64_t                   audio_trigger_last_ts;  /* Last hit timestamp (seconds) */
+        pthread_mutex_t           mutex_audio;           /* Mutex protecting audio state */
+        pthread_mutex_t           mutex_audioq;          /* Mutex protecting the audio queue */
+        pthread_cond_t            cond_audioq;           /* Condition variable used by audio queue */
+        int                      *record_stream_map;     /* Input stream index to output stream index */
+        int                       record_stream_map_size;/* Number of entries in record_stream_map */
+        int64_t                  *record_last_dts;       /* Last written dts for each input stream */
+        int64_t                  *record_last_pts;       /* Last written pts for each input stream */
+        int64_t                  *record_base_dts;       /* First dts per input stream, used to rebase to 0 */
+        int64_t                  *record_base_pts;       /* First pts per input stream, used to rebase to 0 */
+        int                       record_active;         /* Whether event recording is active */
+        AVPacket                **record_pktqueue;       /* Queue of packets pending event recording */
+        int                       record_pktqueue_size;  /* Queue capacity */
+        int                       record_pktqueue_head;  /* Queue read index */
+        int                       record_pktqueue_tail;  /* Queue write index */
+        int                       record_pktqueue_count; /* Number of queued packets */
+        int                       record_thread_finish;  /* Request the record thread to finish */
+        int                       record_thread_finished;/* Whether record thread has exited */
+        int                       record_sync_init;      /* Whether record mutex/cond are initialized */
         struct packet_item       *pktarray;              /* Pointer to array of packets for passthru processing */
         int                       pktarray_size;         /* The number of packets in array.  1 based */
         int                       pktarray_index;        /* The index to the most current packet in array */
@@ -109,9 +160,13 @@ struct imgsize_context {
         char                      threadname[16];   /* The thread name*/
         int                       threadnbr;        /* The thread number */
         pthread_t                 thread_id;        /* thread i.d. for a camera-handling thread (if required). */
+        pthread_t                 record_thread_id; /* thread i.d. for record writing thread */
         pthread_mutex_t           mutex;            /* mutex used with conditional waits */
         pthread_mutex_t           mutex_transfer;   /* mutex used with transferring stream info for pass-through */
         pthread_mutex_t           mutex_pktarray;   /* mutex used with the packet array */
+        pthread_mutex_t           mutex_record;     /* mutex used with event recording format state */
+        pthread_mutex_t           mutex_recordq;    /* mutex used with event recording queue */
+        pthread_cond_t            cond_recordq;     /* condition variable used by event recording queue */
 
     };
 
@@ -128,5 +183,7 @@ struct imgsize_context {
 int netcam_rtsp_setup(struct context *cnt);
 int netcam_rtsp_next(struct context *cnt, struct image_data *img_data);
 void netcam_rtsp_cleanup(struct context *cnt, int init_retry_flag);
+int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filename);
+void netcam_rtsp_record_stop(struct rtsp_context *rtsp_data);
 
 #endif /* _INCLUDE_NETCAM_RTSP_H */
