@@ -60,7 +60,7 @@ struct config {
     int             netcam_audio_detection;
     int             netcam_audio_band_low;
     int             netcam_audio_band_high;
-    char            *netcam_audio_trigger_ratio;
+    const char*     netcam_audio_trigger_ratio;
     int             netcam_audio_trigger_window_sec;
     int             netcam_audio_trigger_hits;
 
