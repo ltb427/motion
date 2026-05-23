@@ -835,6 +835,42 @@
           <td align="left"><a href="#native_language" >native_language</a></td>
         </tr>
         <tr>
+          <td align="left">netcam_audio_band_high</td>
+          <td align="left">netcam_audio_band_high</td>
+          <td align="left">netcam_audio_band_high</td>
+          <td align="left"><a href="#netcam_audio_band_high" >netcam_audio_band_high</a></td>
+        </tr>
+        <tr>
+          <td align="left">netcam_audio_band_low</td>
+          <td align="left">netcam_audio_band_low</td>
+          <td align="left">netcam_audio_band_low</td>
+          <td align="left"><a href="#netcam_audio_band_low" >netcam_audio_band_low</a></td>
+        </tr>
+        <tr>
+          <td align="left">netcam_audio_detection</td>
+          <td align="left">netcam_audio_detection</td>
+          <td align="left">netcam_audio_detection</td>
+          <td align="left"><a href="#netcam_audio_detection" >netcam_audio_detection</a></td>
+        </tr>
+        <tr>
+          <td align="left">netcam_audio_trigger_hits</td>
+          <td align="left">netcam_audio_trigger_hits</td>
+          <td align="left">netcam_audio_trigger_hits</td>
+          <td align="left"><a href="#netcam_audio_trigger_hits" >netcam_audio_trigger_hits</a></td>
+        </tr>
+        <tr>
+          <td align="left">netcam_audio_trigger_ratio</td>
+          <td align="left">netcam_audio_trigger_ratio</td>
+          <td align="left">netcam_audio_trigger_ratio</td>
+          <td align="left"><a href="#netcam_audio_trigger_ratio" >netcam_audio_trigger_ratio</a></td>
+        </tr>
+        <tr>
+          <td align="left">netcam_audio_trigger_window_sec</td>
+          <td align="left">netcam_audio_trigger_window_sec</td>
+          <td align="left">netcam_audio_trigger_window_sec</td>
+          <td align="left"><a href="#netcam_audio_trigger_window_sec" >netcam_audio_trigger_window_sec</a></td>
+        </tr>
+        <tr>
           <td align="left"></td>
           <td align="left"></td>
           <td align="left">netcam_high_params</td>
@@ -1615,6 +1651,14 @@
               <td bgcolor="#edf4f9" ><a href="#netcam_high_params" >netcam_high_params</a> </td>
             </tr>
             <tr>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_detection" >netcam_audio_detection</a> </td>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_band_low" >netcam_audio_band_low</a> </td>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_band_high" >netcam_audio_band_high</a> </td>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_trigger_ratio" >netcam_audio_trigger_ratio</a> </td>
+            </tr>
+            <tr>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_trigger_window_sec" >netcam_audio_trigger_window_sec</a> </td>
+              <td bgcolor="#edf4f9" ><a href="#netcam_audio_trigger_hits" >netcam_audio_trigger_hits</a> </td>
               <td bgcolor="#edf4f9" ><a href="#netcam_userpass" >netcam_userpass</a> </td>
             </tr>
           </tbody>
@@ -3223,6 +3267,86 @@
         <p></p>
         The username and password for the network camera.  The string is specified as username:password.
         If the camera does not have any authentication to the stream, leave this option empty.
+        <p></p>
+
+        <h3><a name="netcam_audio_detection"></a> netcam_audio_detection </h3>
+        <p></p>
+        <ul>
+          <li> Type: Boolean</li>
+          <li> Range / Valid values: on, off</li>
+          <li> Default: on</li>
+        </ul>
+        <p></p>
+        Enable or disable RTSP audio frequency analysis and audio-triggered events.
+        <p></p>
+        This option applies only to RTSP/RTMP style camera streams that include audio.
+        Motion pixel-based detection is unchanged by this setting.
+        <p></p>
+
+        <h3><a name="netcam_audio_band_low"></a> netcam_audio_band_low </h3>
+        <p></p>
+        <ul>
+          <li> Type: Integer</li>
+          <li> Range / Valid values: Positive integer (Hz)</li>
+          <li> Default: 300</li>
+        </ul>
+        <p></p>
+        Lower edge (Hz) of the frequency band used for RTSP audio triggering.
+        <p></p>
+        Use this together with <a href="#netcam_audio_band_high">netcam_audio_band_high</a>.
+        The low value must be less than the high value.
+        <p></p>
+
+        <h3><a name="netcam_audio_band_high"></a> netcam_audio_band_high </h3>
+        <p></p>
+        <ul>
+          <li> Type: Integer</li>
+          <li> Range / Valid values: Positive integer (Hz)</li>
+          <li> Default: 3400</li>
+        </ul>
+        <p></p>
+        Upper edge (Hz) of the frequency band used for RTSP audio triggering.
+        <p></p>
+        This value should be greater than <a href="#netcam_audio_band_low">netcam_audio_band_low</a>.
+        The default speech-band range (300-3400 Hz) is suitable for many indoor use cases.
+        <p></p>
+
+        <h3><a name="netcam_audio_trigger_ratio"></a> netcam_audio_trigger_ratio </h3>
+        <p></p>
+        <ul>
+          <li> Type: String / Decimal</li>
+          <li> Range / Valid values: 0.0-1.0, or 1-100 (percent style)</li>
+          <li> Default: 0.60</li>
+        </ul>
+        <p></p>
+        Trigger threshold for RTSP audio analysis.
+        It is evaluated as band_energy / total_energy for each analyzed audio frame.
+        <p></p>
+        Larger values reduce sensitivity and can reduce false triggers.
+        <p></p>
+
+        <h3><a name="netcam_audio_trigger_window_sec"></a> netcam_audio_trigger_window_sec </h3>
+        <p></p>
+        <ul>
+          <li> Type: Integer</li>
+          <li> Range / Valid values: Positive integer (seconds)</li>
+          <li> Default: 5</li>
+        </ul>
+        <p></p>
+        Debounce window for audio trigger hit accumulation.
+        Only hits occurring inside this many seconds are counted together.
+        <p></p>
+
+        <h3><a name="netcam_audio_trigger_hits"></a> netcam_audio_trigger_hits </h3>
+        <p></p>
+        <ul>
+          <li> Type: Integer</li>
+          <li> Range / Valid values: Positive integer</li>
+          <li> Default: 3</li>
+        </ul>
+        <p></p>
+        Number of hits required within <a href="#netcam_audio_trigger_window_sec">netcam_audio_trigger_window_sec</a>
+        before one audio event is emitted.
         <p></p>
 
         <p></p>

@@ -37,3 +37,7 @@ Issues and Patches should be submitted via github and include detail description
 of the issue being addressed as well as any documentation updates that would be
 needed with the change.
 
+## Feature Updates (`audio_feature` branch)
+
+This branch adds **RTSP audio-based motion detection** and **event-scoped A/V MP4 recording** on top of the upstream Motion project. Below is a summary of changes since commit `09afbfd`.
+

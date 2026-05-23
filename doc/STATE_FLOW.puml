@@ -1,0 +1,68 @@
+@startuml
+skinparam backgroundColor #FCFCF8
+skinparam shadowing false
+skinparam defaultFontName Noto Sans CJK SC
+skinparam ArrowColor #444444
+skinparam state {
+  BorderColor #6B7280
+  FontColor #111827
+  BackgroundColor #F9FAFB
+}
+
+title Motion Runtime State Flow  (RTSP-Centric)
+
+state "Startup Init" as StartupInitialization
+state "Monitoring Idle" as MonitoringIdle
+state "Trigger Event" as TriggerEvent
+state "Event Ongoing" as EventOngoing
+state "Reload Config" as ReloadConfiguration
+state "Graceful Shutdown" as GracefulShutdown
+state "Error Exit" as ErrorExit #FDECEC
+
+[*] --> StartupInitialization
+StartupInitialization --> MonitoringIdle : init ok
+StartupInitialization --> ErrorExit : init failed
+
+MonitoringIdle --> MonitoringIdle : no trigger
+MonitoringIdle --> TriggerEvent : motion trigger
+MonitoringIdle --> TriggerEvent : audio trigger
+TriggerEvent --> EventOngoing
+EventOngoing --> MonitoringIdle : event ended
+
+MonitoringIdle --> ReloadConfiguration : reload signal
+ReloadConfiguration --> MonitoringIdle : reload ok
+ReloadConfiguration --> ErrorExit : reload failed
+
+MonitoringIdle --> GracefulShutdown : exit signal
+GracefulShutdown --> [*]
+ErrorExit --> [*]
+
+note right of StartupInitialization
+  Load config
+  Init logging
+  Init video source
+  Init web service
+end note
+
+note right of MonitoringIdle
+  Capture frame
+  Decode and preprocess
+  Motion analysis
+  RTSP audio analysis (FFTW)
+end note
+
+note right of TriggerEvent
+  Evaluate trigger source
+  Run alarm actions
+  Image output
+  Video encoding
+  DB write + web status push
+end note
+
+note right of EventOngoing
+  Continuous capture and detection
+  Stay while motion persists
+  End when stillness threshold is met
+end note
+
+@enduml

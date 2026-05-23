@@ -741,7 +741,6 @@ static int netcam_rtsp_audio_analyze_frame(struct rtsp_context *rtsp_data, AVFra
 #ifdef HAVE_FFTW3
     int converted_samples;
     int out_samples;
-    int channel_layout;
     uint8_t **out_data = NULL;
     int out_linesize = 0;
     double total_energy = 0.0;

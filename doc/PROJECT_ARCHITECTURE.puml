@@ -1,0 +1,103 @@
+@startuml
+skinparam backgroundColor #FAFAF7
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam defaultFontName Noto Sans CJK SC
+skinparam ArrowColor #444444
+skinparam package {
+  BorderColor #6B7280
+  FontColor #111827
+}
+skinparam rectangle {
+  BorderColor #6B7280
+  FontColor #111827
+}
+
+title Motion Project Architecture (RTSP-Centric)
+left to right direction
+
+package "Configuration and Infrastructure" as Infra {
+  [conf.c\nconf.h\nConfiguration Loader] as Conf
+  [logger.c\nlogger.h\nLogging] as Logger
+  [util.c\nutil.h\nUtilities] as Util
+  [translate.c\ntranslate.h\nI18N Text] as Translate
+}
+
+package "Input Layer" as Input {
+  package "RTSP Camera Input" as NetCamPkg {
+    [netcam.c\nInput Coordination] as Netcam
+    [netcam_rtsp.c\nRTSP Demux/Decode] as NetRtsp
+  }
+}
+
+package "Core Processing" as Core {
+  [motion.c\nMain Pipeline / Scheduler] as Motion
+  [alg.c\nMotion Detection] as Alg
+  [netcam_rtsp.c\nAudio Decode / FFT Analysis\n(FFTW)] as AudioDetect
+  [track.c\nObject Tracking] as Track
+  [draw.c\nOverlay Rendering] as Draw
+  [rotate.c\nFrame Rotation] as Rotate
+  [picture.c\nImage Processing Pipeline] as Picture
+  [jpegutils.c\nJPEG Helpers] as Jpeg
+  [ffmpeg.c\nVideo Encoding / Muxing] as FFmpeg
+}
+
+package "Event and Outputs" as Output {
+  [event.c\nEvent Bus] as Event
+  [dbse.c\nDatabase Event Storage] as DBSE
+  [video_loopback.c\nVirtual Video Output] as Loopback
+}
+
+package "Web Control and Streaming" as Web {
+  [webu.c\nWeb Service Entry] as WebU
+  [webu_html.c\nHTML UI] as WebHtml
+  [webu_stream.c\nStreaming API] as WebStream
+  [webu_status.c\nStatus API] as WebStatus
+  [webu_text.c\nText API] as WebText
+}
+
+database "External Database" as ExtDB
+cloud "RTSP Camera Source" as ExtCam
+actor "Browser / Client" as Client
+
+ExtCam --> Netcam
+Netcam --> NetRtsp
+
+Netcam --> Motion
+NetRtsp --> AudioDetect
+Alg --> Motion : Motion Trigger
+AudioDetect --> Motion : Audio Trigger
+
+Motion --> Alg
+Motion --> Track
+Motion --> Rotate
+Motion --> Draw
+Motion --> Picture
+Picture --> Jpeg
+Picture --> FFmpeg
+
+Motion --> Event
+Event --> DBSE
+DBSE --> ExtDB
+Motion --> Loopback
+
+Motion --> WebU
+WebU --> WebHtml
+WebU --> WebStream
+WebU --> WebStatus
+WebU --> WebText
+Client --> WebU
+
+Conf --> Motion
+Logger --> Motion
+Util --> Motion
+Translate --> WebU
+Translate --> Event
+
+note bottom of Motion
+  motion.c is the central orchestrator connecting
+  RTSP ingestion, detection, events, encoding,
+  and web control.
+end note
+
+@enduml
