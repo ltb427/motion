@@ -1,3 +1,8 @@
+Summary of changes for version 4.5.2 are below
+    * RTSP NETCAM event triggers mp4 video recording(with audio stream)
+    * RTSP NETCAM audio FFT analysis triggers audio events(same with motion trigger)
+    * Update configuration items netcam_audio_detection netcam_audio_band_high
+      netcam_audio_trigger_ratio netcam_audio_trigger_window_sec netcam_audio_trigger_hits
 Summary of changes for version 4.5.1 are below
     * Improve closing of v4l2 devices
     * Fix creation of pid_file

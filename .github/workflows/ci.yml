@@ -44,40 +44,40 @@ jobs:
       - name: Build
         run: make -j"$(nproc)"
 
-  # maintainer-check:
-  #   name: Maintainer check on Ubuntu
-  #   runs-on: ubuntu-latest
+  maintainer-check:
+    name: Maintainer check on Ubuntu
+    runs-on: ubuntu-latest
 
-  #   steps:
-  #     - name: Check out repository
-  #       uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-  #     - name: Install build dependencies
-  #       run: |
-  #         sudo apt-get update
-  #         sudo apt-get install -y \
-  #           build-essential \
-  #           autoconf \
-  #           automake \
-  #           libtool \
-  #           gettext \
-  #           pkg-config \
-  #           libjpeg-dev \
-  #           libmicrohttpd-dev \
-  #           libfftw3-dev \
-  #           libavutil-dev \
-  #           libavformat-dev \
-  #           libavcodec-dev \
-  #           libswscale-dev \
-  #           libswresample-dev \
-  #           libavdevice-dev \
-  #           autopoint
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            pkg-config \
+            libjpeg-dev \
+            libmicrohttpd-dev \
+            libfftw3-dev \
+            libavutil-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libavdevice-dev \
+            autopoint
 
-  #     - name: Generate build system
-  #       run: autoreconf -fiv
+      - name: Generate build system
+        run: autoreconf -fiv
 
-  #     - name: Configure
-  #       run: ./configure
+      - name: Configure
+        run: ./configure
 
-  #     - name: Run maintainer check
-  #       run: make maintainer-check
+      - name: Run maintainer check
+        run: make maintainer-check

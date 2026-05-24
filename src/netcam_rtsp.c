@@ -66,6 +66,18 @@
 #define RTSP_AUDIO_TRIGGER_WINDOW_SEC 5
 #define RTSP_AUDIO_TRIGGER_HITS 3
 
+#if defined(FF_API_OLD_CHANNEL_LAYOUT)
+    #if defined(AV_CHANNEL_LAYOUT_MONO)
+        #define MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API 1
+    #else
+        #define MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API (!FF_API_OLD_CHANNEL_LAYOUT)
+    #endif
+#elif defined(LIBAVUTIL_VERSION_MAJOR)
+    #define MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API (LIBAVUTIL_VERSION_MAJOR >= 59)
+#else
+    #define MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API 0
+#endif
+
 static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *packet);
 static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *packet);
 static void *netcam_rtsp_record_handler(void *arg);
@@ -286,7 +298,7 @@ static int netcam_rtsp_record_enqueue(struct rtsp_context *rtsp_data, AVPacket *
 int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filename)
 {
 
-    int indx;
+    unsigned int indx;
     int retcd;
     int mapped_streams;
     AVFormatContext *record_format;
@@ -347,7 +359,7 @@ int netcam_rtsp_record_start(struct rtsp_context *rtsp_data, const char *filenam
         rtsp_data->record_last_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
         rtsp_data->record_base_dts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
         rtsp_data->record_base_pts = mymalloc(sizeof(int64_t) * rtsp_data->record_stream_map_size);
-        for (indx = 0; indx < rtsp_data->record_stream_map_size; indx++) {
+        for (indx = 0; indx < (unsigned int)rtsp_data->record_stream_map_size; indx++) {
             rtsp_data->record_stream_map[indx] = -1;
             rtsp_data->record_last_dts[indx] = AV_NOPTS_VALUE;
             rtsp_data->record_last_pts[indx] = AV_NOPTS_VALUE;
@@ -911,7 +923,13 @@ static int netcam_rtsp_audio_open_codec(struct rtsp_context *rtsp_data)
 #if ( MYFFVER >= 57041)
     int retcd;
     my_AVCodec *audio_decoder = NULL;
-    int64_t channel_layout;
+    #if MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API
+        AVChannelLayout in_ch_layout;
+        AVChannelLayout out_ch_layout;
+        int have_in_ch_layout = FALSE;
+    #else
+        int64_t channel_layout;
+    #endif
 
     if ((rtsp_data == NULL) || (rtsp_data->format_context == NULL) ||
         (rtsp_data->format_context->nb_streams <= 0) ||
@@ -965,32 +983,77 @@ static int netcam_rtsp_audio_open_codec(struct rtsp_context *rtsp_data)
             , rtsp_data->cameratype);
         return -1;
     }
-
-    rtsp_data->audio_channels = rtsp_data->audio_codec_context->channels;
-    if (rtsp_data->audio_channels <= 0) {
-        rtsp_data->audio_channels = av_get_channel_layout_nb_channels(rtsp_data->audio_codec_context->channel_layout);
-    }
+    #if MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API
+        rtsp_data->audio_channels = rtsp_data->audio_codec_context->ch_layout.nb_channels;
+        if (rtsp_data->audio_channels <= 0) {
+            MOTION_LOG(ERR, TYPE_NETCAM, NO_ERRNO
+                ,_("%s: audio_channels is <= 0")
+                , rtsp_data->cameratype);
+        }
+    #else
+        rtsp_data->audio_channels = rtsp_data->audio_codec_context->channels;
+        if (rtsp_data->audio_channels <= 0) {
+            rtsp_data->audio_channels = av_get_channel_layout_nb_channels(rtsp_data->audio_codec_context->channel_layout);
+        }
+    #endif
     if (rtsp_data->audio_channels <= 0) {
         rtsp_data->audio_channels = 1;
     }
 
-    channel_layout = rtsp_data->audio_codec_context->channel_layout;
-    if (channel_layout == 0) {
-        channel_layout = av_get_default_channel_layout(rtsp_data->audio_channels);
-    }
+    #if MY_RTSP_USE_NEW_CHANNEL_LAYOUT_API
+        memset(&in_ch_layout, 0, sizeof(in_ch_layout));
+        memset(&out_ch_layout, 0, sizeof(out_ch_layout));
 
-    rtsp_data->audio_swr = swr_alloc_set_opts(NULL,
-        AV_CH_LAYOUT_MONO,
-        AV_SAMPLE_FMT_DBL,
-        rtsp_data->audio_sample_rate,
-        channel_layout,
-        rtsp_data->audio_codec_context->sample_fmt,
-        rtsp_data->audio_sample_rate,
-        0,
-        NULL);
-    if (rtsp_data->audio_swr == NULL) {
-        return -1;
-    }
+        if (rtsp_data->audio_codec_context->ch_layout.nb_channels > 0) {
+            retcd = av_channel_layout_copy(&in_ch_layout, &rtsp_data->audio_codec_context->ch_layout);
+            if (retcd < 0) {
+                return -1;
+            }
+            have_in_ch_layout = TRUE;
+        } else {
+            av_channel_layout_default(&in_ch_layout, rtsp_data->audio_channels);
+            have_in_ch_layout = TRUE;
+        }
+
+        av_channel_layout_default(&out_ch_layout, 1);
+
+        retcd = swr_alloc_set_opts2(&rtsp_data->audio_swr,
+            &out_ch_layout,
+            AV_SAMPLE_FMT_DBL,
+            rtsp_data->audio_sample_rate,
+            &in_ch_layout,
+            rtsp_data->audio_codec_context->sample_fmt,
+            rtsp_data->audio_sample_rate,
+            0,
+            NULL);
+
+        if (have_in_ch_layout) {
+            av_channel_layout_uninit(&in_ch_layout);
+        }
+        av_channel_layout_uninit(&out_ch_layout);
+
+        if ((retcd < 0) || (rtsp_data->audio_swr == NULL)) {
+            return -1;
+        }
+    #else
+        channel_layout = rtsp_data->audio_codec_context->channel_layout;
+        if (channel_layout == 0) {
+            channel_layout = av_get_default_channel_layout(rtsp_data->audio_channels);
+        }
+
+        rtsp_data->audio_swr = swr_alloc_set_opts(NULL,
+            AV_CH_LAYOUT_MONO,
+            AV_SAMPLE_FMT_DBL,
+            rtsp_data->audio_sample_rate,
+            channel_layout,
+            rtsp_data->audio_codec_context->sample_fmt,
+            rtsp_data->audio_sample_rate,
+            0,
+            NULL);
+        if (rtsp_data->audio_swr == NULL) {
+            return -1;
+        }
+    #endif
 
     retcd = swr_init(rtsp_data->audio_swr);
     if (retcd < 0) {
@@ -1660,8 +1723,8 @@ static int netcam_rtsp_record_write(struct rtsp_context *rtsp_data, AVPacket *pa
             return 0;
         }
 
-        if ((in_index >= rtsp_data->format_context->nb_streams) ||
-            (out_index >= rtsp_data->record_format->nb_streams)) {
+        if (((unsigned int)in_index >= rtsp_data->format_context->nb_streams) ||
+            ((unsigned int)out_index >= rtsp_data->record_format->nb_streams)) {
             pthread_mutex_unlock(&rtsp_data->mutex_record);
             return 0;
         }
