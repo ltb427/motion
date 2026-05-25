@@ -44,6 +44,22 @@
 
 #ifdef HAVE_FFMPEG
 
+#if defined(FF_API_FRAME_KEY)
+    #if FF_API_FRAME_KEY
+        #if defined(AV_FRAME_FLAG_KEY)
+            #define MY_FRAME_USE_FLAGS_KEY 1
+        #else
+            #define MY_FRAME_USE_FLAGS_KEY 0
+        #endif
+    #else
+        #define MY_FRAME_USE_FLAGS_KEY 1
+    #endif
+#elif defined(LIBAVUTIL_VERSION_MAJOR)
+    #define MY_FRAME_USE_FLAGS_KEY (LIBAVUTIL_VERSION_MAJOR >= 59)
+#else
+    #define MY_FRAME_USE_FLAGS_KEY 0
+#endif
+
 static void ffmpeg_free_pkt(struct ffmpeg *ffmpeg)
 {
     if (ffmpeg->pkt != NULL) {
@@ -1076,7 +1092,7 @@ static int ffmpeg_put_frame(struct ffmpeg *ffmpeg, const struct timeval *tv1)
 
 }
 
-static void ffmpeg_passthru_reset(struct ffmpeg *ffmpeg)
+static void __attribute__((unused)) ffmpeg_passthru_reset(struct ffmpeg *ffmpeg)
 {
     /* Reset the written flag at start of each event */
     int indx;
@@ -1125,7 +1141,7 @@ static void ffmpeg_passthru_write(struct ffmpeg *ffmpeg, int indx)
 
 }
 
-static int ffmpeg_passthru_put(struct ffmpeg *ffmpeg, struct image_data *img_data)
+static int __attribute__((unused)) ffmpeg_passthru_put(struct ffmpeg *ffmpeg, struct image_data *img_data)
 {
 
     int idnbr_image, idnbr_lastwritten, idnbr_stop, idnbr_firstkey;
@@ -1202,7 +1218,7 @@ static int ffmpeg_passthru_put(struct ffmpeg *ffmpeg, struct image_data *img_dat
     return 0;
 }
 
-static int ffmpeg_passthru_codec(struct ffmpeg *ffmpeg)
+static int __attribute__((unused)) ffmpeg_passthru_codec(struct ffmpeg *ffmpeg)
 {
 
     int retcd;
@@ -1546,11 +1562,19 @@ int ffmpeg_put_image(struct ffmpeg *ffmpeg, struct image_data *img_data, const s
             ffmpeg->gop_cnt ++;
             if (ffmpeg->gop_cnt == ffmpeg->ctx_codec->gop_size ) {
                 ffmpeg->picture->pict_type = AV_PICTURE_TYPE_I;
-                ffmpeg->picture->key_frame = 1;
+                #if MY_FRAME_USE_FLAGS_KEY
+                    ffmpeg->picture->flags |= AV_FRAME_FLAG_KEY;
+                #else
+                    ffmpeg->picture->key_frame = 1;
+                #endif
                 ffmpeg->gop_cnt = 0;
             } else {
                 ffmpeg->picture->pict_type = AV_PICTURE_TYPE_P;
-                ffmpeg->picture->key_frame = 0;
+                #if MY_FRAME_USE_FLAGS_KEY
+                    ffmpeg->picture->flags &= ~AV_FRAME_FLAG_KEY;
+                #else
+                    ffmpeg->picture->key_frame = 0;
+                #endif
             }
 
             /* A return code of -2 is thrown by the put_frame
